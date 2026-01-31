@@ -2,7 +2,7 @@
 按照yaml创建、管理docker容器。需要以root权限运行
 loguru作为日志系统
 
-TODO 阶段1 容器管理
+容器管理
 手动启动的命令如下
 ``` bash
 docker run -itd --rm --privileged --shm-size=2g \
