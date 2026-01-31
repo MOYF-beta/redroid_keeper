@@ -32,7 +32,7 @@ class AGTDevice:
         return f"{self.adb_host}:{self.adb_port}"
 
     # Internal maatouch device, created after connect()
-    _touch_device: Optional["MNTDevice"] = None
+    _touch_device: Optional["AGTDevice"] = None
 
     def _run(self, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
         logger.debug("Running command: {}", " ".join(cmd))
