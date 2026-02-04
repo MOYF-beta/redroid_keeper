@@ -20,11 +20,13 @@ if TYPE_CHECKING:
 
 DEFAULT_ADB_BASE_PORT = 5555
 DEFAULT_ADB_HOST = "127.0.0.1"
-
+DEFAULT_TOUCH_MARGIN_MS = 10
+RECORD_BEFORE = 1  # seconds
+RECORD_TIME = 5   # seconds
 SYSTEM_PROMPT = '''
-你是一个操作Android手机的机器人。理解用户的需求，详细分析截图含有什么元素，按钮，在多轮交互中用下面的工具操作手机以完成任务。如果重复操作了数次没有效果，说明当前操作无法实现目标，需要调整思路。
+你是一个操作Android手机的机器人。理解用户的需求，详细分析截图含有什么元素，按钮，在多轮交互中用下面的工具操作手机以完成任务。如果重复操作了数次没有效果，说明当前操作无法实现目标，需要调整思路。当需要总结内容，确保上下滑动查看并记下全部内容。每获取一些新的信息都立刻以文本形式说出以便后面整合。
 
-请注意考虑一些常识，例如高亮的内容代表已经选中。你应该列出常识，做出思考，再付诸行动。
+请注意考虑一些常识，例如高亮的内容代表已经选中。你应该列出常识，做出思考，再付诸行动。尽可能跳过无用的东西或是登录，尽可能选择有利于隐私的选项。
 
 下面是你可以使用的工具：
 
@@ -42,20 +44,17 @@ touch工具可以通过bbox检测框操作屏幕:
 {"bbox_2d": [x, y, x, y], "label": "touch.tool_name1(args1) "}
 continus状态会被普通操作打断
 
-text工具用于文本输入:
+text工具用于文本输入，尽可能使用此工具，除非必要避免使用屏幕键盘:
 
-- text.input(text:str)
-- text.clear()
+- text.input(text:str) # 提示，在输入前一般需要先点击输入框以获取焦点
+- text.del(n_char:int) # 删除光标前n_char个字符，默认为50
 
 dev工具用于设备操作:
 
 - dev.screenshot(output_path:str) (保存在./agt_screenshots/目录下)
-- dev.get_app_list() -> list of {package_name:str, label:str}
-- dev.get_current_app() -> package_name
-- dev.launch_app(package_name:str)
-- dev.press_home()
-- dev.press_back()
-- dev.press_task()
+- dev.press_home() # 此工具最适合回到桌面
+- dev.press_back() # 此工具用户回到上一个页面
+- dev.press_task() # 此工具用于打开多任务管理界面，连续调用两次可以回到之前的应用
 
 wait工具用于等待:
 - wait(duration_ms)
@@ -66,10 +65,11 @@ wait工具用于等待:
 请以json格式输出调用列表到代码块，工具调用一行一个，这些调用按顺序执行
 为了确保的操作有效，思路清晰，请严格按照下面分割线中的模板输出:
 -------------------------------------------------------------
+我有已知信息: {需要记录的memo}
+
 上一步，我进行了:{上一步的操作}，看起来效果是:{效果描述}，我{成功 or 失败}地完成了上一步。
 而现在，我在屏幕上看到了：{屏幕上的各个元素}
-一般而言，这种界面有如下常识：{常识}
-我{需要 or 不需要}做出调整，因为：{原因}
+这意味着：{当前手机的状态}{当前屏幕信息的意义}
 我的最终目的是：{我的目标}
 我的阶段性目的是：{当前阶段目标}
 所以我应该：{我的动作}
@@ -360,8 +360,22 @@ class AGTDevice:
         if res.returncode != 0:
             logger.warning("failed to start %s: %s %s", package_name, res.stdout, res.stderr)
     
-    def agent_call(self, call_string: str) -> str:
+    def agent_call(self, call_string: str, get_video: bool = False) -> str:
         logger.info(f"agent_call: {call_string}")
+
+        path_to_video = None
+        screen_record_process = None
+        remote_video_path = f"/sdcard/record_{int(time.time())}.mp4"
+
+        if get_video:
+            # Start recording in the background
+            record_cmd = [
+                "adb", "-s", self.adb_target, "shell",
+                "screenrecord", f"--time-limit={int(RECORD_BEFORE + RECORD_TIME)}", remote_video_path
+            ]
+            logger.debug(f"Starting screen record: {' '.join(record_cmd)}")
+            screen_record_process = subprocess.Popen(record_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(RECORD_BEFORE)
         
         # 1. Extract JSON block
         json_content = call_string
@@ -447,7 +461,7 @@ class AGTDevice:
                                  logger.warning(f"Failed to parse args completely: {args_str}")
                                  continue
 
-                # Merge args for legacy compatibility (some code uses numerical indexing)
+                # Merege args for legacy compatibility (some code uses numerical indexing)
                 args = pos_args 
 
                 logger.debug(f"Executing {func_name} with pos_args={pos_args} kw_args={kw_args} bbox={bbox}")
@@ -471,12 +485,31 @@ class AGTDevice:
                 def to_pixel(rel_x, rel_y):
                     return int(rel_x * self.width / 1000), int(rel_y * self.height / 1000)
 
+                # -------------------------------------------------------------
+                # Implicit Tap Logic & Touch Delay
+                # -------------------------------------------------------------
+                # If a bbox is provided but the function is NOT a touch consumer (e.g. text.input),
+                # perform an implicit tap on the center of the bbox first.
+                touch_consumers = {
+                    "touch.tap", "touch.long_tap", "touch.swipe", "touch.zoom", 
+                    "touch.continus.down", "touch.continus.move_to"
+                }
+                
+                if bbox and func_name not in touch_consumers:
+                    cx = (bbox[0] + bbox[2]) / 2
+                    cy = (bbox[1] + bbox[3]) / 2
+                    px, py = to_pixel(cx, cy)
+                    logger.debug(f"Implicit tap at {px},{py} for {func_name}")
+                    self.tap([(px, py)])
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+
                 if func_name == "touch.tap":
                     if bbox:
                         cx = (bbox[0] + bbox[2]) / 2
                         cy = (bbox[1] + bbox[3]) / 2
                         px, py = to_pixel(cx, cy)
                         self.tap([(px, py)])
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                 
                 elif func_name == "touch.long_tap":
                     if bbox:
@@ -485,6 +518,7 @@ class AGTDevice:
                         cy = (bbox[1] + bbox[3]) / 2
                         px, py = to_pixel(cx, cy)
                         self.tap([(px, py)], duration=duration)
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                 
                 elif func_name == "touch.swipe":
                     if bbox and len(args) >= 2:
@@ -554,6 +588,7 @@ class AGTDevice:
                         # Calculate parts for ~50Hz (20ms) updates if possible
                         part = max(int(duration / 20), 5)
                         self.ext_smooth_swipe([start_px_py, end_px_py], duration=duration, part=part)
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                         
                 elif func_name == "touch.zoom":
                     if bbox and len(args) >= 2:
@@ -564,6 +599,7 @@ class AGTDevice:
                         p1 = to_pixel(bbox[0], bbox[1])
                         p2 = to_pixel(bbox[2], bbox[3])
                         self.pinch_zoom([p1, p2], scale=scale, duration=duration)
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                 
                 elif func_name == "touch.continus.down":
                     if bbox:
@@ -589,6 +625,7 @@ class AGTDevice:
                              object.__setattr__(self, "_hold_locked", True)
                         else:
                              object.__setattr__(self, "_hold_locked", False)
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
 
                 elif func_name == "touch.continus.move_to":
                     if bbox:
@@ -603,12 +640,14 @@ class AGTDevice:
                              duration = args[0] if len(args) > 0 else 500
                              self.ext_smooth_swipe([start_pos, (px, py)], duration=duration, no_down=True, no_up=True)
                              object.__setattr__(self, "_last_touch_pos", (px, py))
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
 
                 elif func_name == "touch.continus.up":
                     self.up()
                     object.__setattr__(self, "_last_touch_pos", None)
                     object.__setattr__(self, "_is_holding", False)
                     object.__setattr__(self, "_hold_locked", False)
+                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
 
                 elif func_name == "text.input":
                     if args:
@@ -624,12 +663,26 @@ class AGTDevice:
                             b64_encoded = base64.b64encode(text_content.encode('utf-8')).decode('utf-8')
                             self._adb_shell(f"am broadcast -a ADB_INPUT_B64 --es msg {b64_encoded}", check=False)
 
-                elif func_name == "text.clear":
-                    # Delete 50 chars as crude implementation
+                elif func_name == "text.del" or func_name == "text.clear":
+                    # Delete n_char chars
+                    if func_name == "text.del" and args:
+                        n_char = int(args[0])
+                    else:
+                        n_char = 1
+                        
                     cmd = "input keyevent 123" # MOVE_END
-                    for _ in range(50):
-                         cmd += "; input keyevent 67" # DEL
-                    self._adb_shell(cmd)
+                    # Split into chunks to avoid "Argument list too long" if n_char is large
+                    # Max length of command line is limited, but here we concatenate many commands.
+                    # It's safer to loop if n_char is very large, but forreasonable sizes:
+                    
+                    if n_char > 100:
+                         # Process in batches
+                         for _ in range(n_char):
+                             self._adb_shell("input keyevent 67")
+                    else:
+                        for _ in range(n_char):
+                             cmd += "; input keyevent 67" # DEL
+                        self._adb_shell(cmd)
 
                 elif func_name == "dev.screenshot":
                     if args:
@@ -687,7 +740,37 @@ class AGTDevice:
              object.__setattr__(self, "_hold_locked", False)
              raise RuntimeError("Constraint Violation: touch.continus.down() used without hold=True must be closed by touch.continus.up() within the same agent_call.")
 
-        return "success"
+        if screen_record_process:
+            # Wait for recording to finish
+            try:
+                # Wait for the recording time plus a small buffer
+                timeout = RECORD_BEFORE + RECORD_TIME + 2
+                screen_record_process.wait(timeout=timeout)
+                
+                # Pull video from device
+                local_video_dir = os.path.join(os.getcwd(), "videos")
+                os.makedirs(local_video_dir, exist_ok=True)
+                local_video_path = os.path.join(local_video_dir, os.path.basename(remote_video_path))
+                
+                pull_cmd = ["adb", "-s", self.adb_target, "pull", remote_video_path, local_video_path]
+                pull_res = self._run(pull_cmd, check=False)
+                
+                if pull_res.returncode == 0:
+                    path_to_video = local_video_path
+                    logger.info(f"Screen recording saved to {path_to_video}")
+                else:
+                    logger.error(f"Failed to pull screen recording: {pull_res.stderr}")
+
+                # Clean up remote file
+                self._adb_shell(f"rm {remote_video_path}", check=False)
+
+            except subprocess.TimeoutExpired:
+                logger.warning("Screen record process timed out.")
+                screen_record_process.kill()
+            except Exception as e:
+                logger.error(f"Error during video processing: {e}")
+
+        return "success", path_to_video
 
 
 def _parse_packages(output: str | None) -> list[str]:
