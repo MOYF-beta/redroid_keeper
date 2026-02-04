@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import time
+import base64
 
 from loguru import logger
 if TYPE_CHECKING:
@@ -21,7 +22,7 @@ DEFAULT_ADB_BASE_PORT = 5555
 DEFAULT_ADB_HOST = "127.0.0.1"
 
 SYSTEM_PROMPT = '''
-你是一个操作手机的机器人。理解用户的需求，详细分析截图含有什么元素，按钮，在多轮交互中用下面的工具操作手机以完成任务。如果重复操作了数次没有效果，说明当前操作无法实现目标，需要调整思路。
+你是一个操作Android手机的机器人。理解用户的需求，详细分析截图含有什么元素，按钮，在多轮交互中用下面的工具操作手机以完成任务。如果重复操作了数次没有效果，说明当前操作无法实现目标，需要调整思路。
 
 请注意考虑一些常识，例如高亮的内容代表已经选中。你应该列出常识，做出思考，再付诸行动。
 
@@ -31,7 +32,7 @@ touch工具可以通过bbox检测框操作屏幕:
 
 - touch.tap() # 点按bbox中心
 - touch.long_tap(duration_ms) # 长按bbox中心
-- touch.swipe(duration_ms,direction) # direction 指定极角(度)，在bbox内过目标中心沿指定方向划动
+- touch.swipe(duration_ms,direction) # direction 指定极角(度)，在bbox内过目标中心沿指定方向划动。提示：对于导航类的滑动，距离往往很大，并且自然滑动是反向的，例如向上滑动屏幕查看下方内容，实际上是手指从屏幕下方向上滑动
 - touch.zoom(duration_ms,scale) # 按照scale沿bbox对角线缩放指定倍数
 - touch.continus.down() # 按下屏幕直到下一次 up调用，在此期间可以用 move_to移动
 - touch.continus.down(hold=True) # 按下屏幕直到下一次 up调用，该状态可以跨越多轮对话保持，适合按压后需要观察变化的场景
@@ -49,6 +50,7 @@ text工具用于文本输入:
 dev工具用于设备操作:
 
 - dev.screenshot(output_path:str) (保存在./agt_screenshots/目录下)
+- dev.get_app_list() -> list of {package_name:str, label:str}
 - dev.get_current_app() -> package_name
 - dev.launch_app(package_name:str)
 - dev.press_home()
@@ -421,17 +423,29 @@ class AGTDevice:
                         tree = ast.parse(f"f({args_str})", mode='eval')
                         call_node = tree.body
                         
+                        def _safe_eval(node):
+                            try:
+                                return ast.literal_eval(node)
+                            except ValueError:
+                                if isinstance(node, ast.Name):
+                                    return node.id
+                                raise
+
                         # Evaluate args
-                        pos_args = tuple(ast.literal_eval(a) for a in call_node.args)
-                        kw_args = {k.arg: ast.literal_eval(k.value) for k in call_node.keywords}
+                        pos_args = tuple(_safe_eval(a) for a in call_node.args)
+                        kw_args = {k.arg: _safe_eval(k.value) for k in call_node.keywords}
                     except Exception:
                         logger.warning(f"Failed to parse args with ast: {args_str}, fallback to literal_eval")
                         try:
                              # Fallback to old behavior for simple tuples
                              pos_args = ast.literal_eval(f"({args_str},)")
                         except Exception:
-                             logger.warning(f"Failed to parse args completely: {args_str}")
-                             continue
+                             if func_name == "text.input":
+                                 # Allow raw strings for text input if parsing fails (e.g. spaces, special chars)
+                                 pos_args = (args_str,)
+                             else:
+                                 logger.warning(f"Failed to parse args completely: {args_str}")
+                                 continue
 
                 # Merge args for legacy compatibility (some code uses numerical indexing)
                 args = pos_args 
@@ -600,7 +614,15 @@ class AGTDevice:
                     if args:
                         text_content = str(args[0])
                         safe_text = shlex.quote(text_content)
-                        self._adb_shell(f"input text {safe_text}")
+                        is_ascii = text_content.isascii()
+                        if is_ascii:
+                            self._adb_shell(f"input text {safe_text}")
+                        else:
+                            # Use ADBKeyBoard broadcast for non-ASCII (e.g. Chinese)
+                            # Requires ADBKeyBoard to be installed and enabled
+                            # Use base64 to avoid shell encoding issues
+                            b64_encoded = base64.b64encode(text_content.encode('utf-8')).decode('utf-8')
+                            self._adb_shell(f"am broadcast -a ADB_INPUT_B64 --es msg {b64_encoded}", check=False)
 
                 elif func_name == "text.clear":
                     # Delete 50 chars as crude implementation

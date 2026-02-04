@@ -58,6 +58,11 @@ import shutil as _shutil
 DATA_MOUNT_BASE = "/root/redroid_data"
 IMAGE_BASE = "/root/redroid_images"
 
+ADB_KEYBOARD_APK_NAME = "ADBKeyBoard.apk"
+ADB_KEYBOARD_URL = "https://github.com/senzhk/ADBKeyBoard/releases/download/v2.4-dev/keyboardservice-debug.apk"
+ADB_KEYBOARD_PKG = "com.android.adbkeyboard"
+ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
+
 DEFAULT_DOCKER_SHM_SIZE = "2g"
 DEFAULT_GPU_MODE = "guest"
 DEFAULT_ADB_BASE_PORT = 5555
@@ -200,6 +205,41 @@ def _adb_reconnect(adb_port: int, retries: int = 5, delay: float = 2.0) -> None:
   raise RuntimeError(f"ADB connect failed: {target}")
 
 
+def _download_file(url: str, dest_path: str) -> None:
+  logger.info("Downloading {} to {}", url, dest_path)
+  # Use curl to download
+  res = _run_cmd(["curl", "-L", "-o", dest_path, url], check=False)
+  if res.returncode != 0:
+    raise RuntimeError(f"Failed to download {url}: {res.stderr}")
+
+
+def _ensure_adb_keyboard_apk() -> str:
+  apk_path = os.path.join(IMAGE_BASE, ADB_KEYBOARD_APK_NAME)
+  if not os.path.exists(apk_path):
+    # check if IMAGE_BASE exists
+    os.makedirs(IMAGE_BASE, exist_ok=True)
+    _download_file(ADB_KEYBOARD_URL, apk_path)
+  return apk_path
+
+
+def _setup_adb_keyboard(adb_port: int) -> None:
+  # Check if installed
+  target = f"127.0.0.1:{adb_port}"
+  res = _run_cmd(["adb", "-s", target, "shell", "pm", "list", "packages", ADB_KEYBOARD_PKG], check=False)
+  if ADB_KEYBOARD_PKG not in (res.stdout or ""):
+    logger.info("Installing ADB Keyboard to {}", target)
+    apk_path = _ensure_adb_keyboard_apk()
+    install_res = _run_cmd(["adb", "-s", target, "install", "-r", apk_path], check=False)
+    if install_res.returncode != 0:
+      logger.error("Failed to install ADB Keyboard: {}", install_res.stderr)
+      # Proceed anyway, might fail later but we don't block
+  
+  # Set as default IME
+  logger.info("Setting ADB Keyboard as default IME for {}", target)
+  _run_cmd(["adb", "-s", target, "shell", "ime", "enable", ADB_KEYBOARD_IME], check=False)
+  _run_cmd(["adb", "-s", target, "shell", "ime", "set", ADB_KEYBOARD_IME], check=False)
+
+
 def create_device(device: DeviceConfig) -> None:
   logger.info("Creating device: {}", device.device_id)
   _remove_container_if_exists(device.container_name)
@@ -232,12 +272,14 @@ def create_device(device: DeviceConfig) -> None:
 
   _run_cmd(cmd)
   _adb_reconnect(device.adb_port)
+  _setup_adb_keyboard(device.adb_port)
 
 
 def start_device(device: DeviceConfig) -> None:
   logger.info("Starting device: {}", device.device_id)
   _run_cmd(["docker", "start", device.container_name])
   _adb_reconnect(device.adb_port)
+  _setup_adb_keyboard(device.adb_port)
 
 
 def remove_device(device: DeviceConfig) -> None:
