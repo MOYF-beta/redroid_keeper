@@ -6,7 +6,6 @@ from io import BytesIO
 from typing import Iterable, TYPE_CHECKING, Optional
 
 import ast
-import json
 import math
 import os
 import re
@@ -20,7 +19,9 @@ if TYPE_CHECKING:
 
 DEFAULT_ADB_BASE_PORT = 5555
 DEFAULT_ADB_HOST = "127.0.0.1"
-DEFAULT_TOUCH_MARGIN_MS = 10
+DEFAULT_TOUCH_MARGIN_MS = 100
+DEFAULT_KEY_INPUT_MARGIN_MS = 200
+DEFAULT_PRE_INPUT_DELAY_MS = 400
 RECORD_BEFORE = 1  # seconds
 RECORD_TIME = 5   # seconds
 SYSTEM_PROMPT = '''
@@ -34,7 +35,7 @@ touch工具可以通过bbox检测框操作屏幕:
 
 - touch.tap() # 点按bbox中心
 - touch.long_tap(duration_ms) # 长按bbox中心
-- touch.swipe(duration_ms,direction) # direction 指定极角(度)，在bbox内过目标中心沿指定方向划动。提示：对于导航类的滑动，距离往往很大，并且自然滑动是反向的，例如向上滑动屏幕查看下方内容，实际上是手指从屏幕下方向上滑动
+- touch.swipe(duration_ms,direction) # direction 指定极角(度)，在bbox内过目标中心沿指定方向划动。提示：**对于导航类的滑动，检测框往往需要几乎框住整个屏幕**，并且自然滑动是反向的，例如向上滑动屏幕查看下方内容，实际上是手指从屏幕下方向上滑动
 - touch.zoom(duration_ms,scale) # 按照scale沿bbox对角线缩放指定倍数
 - touch.continus.down() # 按下屏幕直到下一次 up调用，在此期间可以用 move_to移动
 - touch.continus.down(hold=True) # 按下屏幕直到下一次 up调用，该状态可以跨越多轮对话保持，适合按压后需要观察变化的场景
@@ -219,6 +220,12 @@ class AGTDevice:
     # Touch delegation (powered by pymaatouch.MNTDevice)
     def _ensure_touch(self) -> None:
         if getattr(self, "_touch_device", None) is None:
+            try:
+                self.connect()
+            except Exception:
+                # fall through to error below
+                pass
+        if getattr(self, "_touch_device", None) is None:
             raise RuntimeError("touch device not initialized; call connect() first")
 
     def tap(self, points, pressure: int = 100, duration: int | None = None, no_up: bool | None = None):
@@ -391,6 +398,15 @@ class AGTDevice:
         # Replace tabs with spaces as YAML does not support tabs for indentation
         json_content = json_content.replace("\t", "    ")
 
+        # Escape inner quotes in text.input("...") to avoid YAML/JSON parse errors
+        def _escape_text_input_quotes(raw: str) -> str:
+            pattern = r"text\.input\(\"([^\"]*?)\"\)"
+            def _repl(m: re.Match[str]) -> str:
+                return f"text.input(\\\"{m.group(1)}\\\")"
+            return re.sub(pattern, _repl, raw)
+
+        json_content = _escape_text_input_quotes(json_content)
+
         try:
             # use yaml to parse as it's more tolerant of trailing commas/comments
             import yaml
@@ -490,6 +506,7 @@ class AGTDevice:
                 # -------------------------------------------------------------
                 # If a bbox is provided but the function is NOT a touch consumer (e.g. text.input),
                 # perform an implicit tap on the center of the bbox first.
+                did_implicit_tap = False
                 touch_consumers = {
                     "touch.tap", "touch.long_tap", "touch.swipe", "touch.zoom", 
                     "touch.continus.down", "touch.continus.move_to"
@@ -502,6 +519,7 @@ class AGTDevice:
                     logger.debug(f"Implicit tap at {px},{py} for {func_name}")
                     self.tap([(px, py)])
                     time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+                    did_implicit_tap = True
 
                 if func_name == "touch.tap":
                     if bbox:
@@ -521,9 +539,22 @@ class AGTDevice:
                     time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                 
                 elif func_name == "touch.swipe":
-                    if bbox and len(args) >= 2:
-                        duration = args[0]
-                        direction = str(args[1]).lower()
+                    if bbox:
+                        duration = None
+                        direction = None
+                        if len(args) >= 2:
+                            duration = args[0]
+                            direction = args[1]
+                        else:
+                            duration = kw_args.get("duration_ms")
+                            direction = kw_args.get("direction")
+
+                        if duration is None or direction is None:
+                            logger.warning("touch.swipe missing duration/direction args: pos_args={} kw_args={}", args, kw_args)
+                            time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+                            continue
+
+                        direction = str(direction).lower()
                         
                         angle_map = {
                             "up": 90,
@@ -588,6 +619,9 @@ class AGTDevice:
                         # Calculate parts for ~50Hz (20ms) updates if possible
                         part = max(int(duration / 20), 5)
                         self.ext_smooth_swipe([start_px_py, end_px_py], duration=duration, part=part)
+                        # Pause at the end point to reduce inertial scrolling
+                        hold_ms = max(int(duration * 0.1), 1)
+                        time.sleep(hold_ms / 1000.0)
                     time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                         
                 elif func_name == "touch.zoom":
@@ -651,17 +685,42 @@ class AGTDevice:
 
                 elif func_name == "text.input":
                     if args:
+                        # For input tasks, always tap the bbox then wait before typing.
+                        if bbox and not did_implicit_tap:
+                            cx = (bbox[0] + bbox[2]) / 2
+                            cy = (bbox[1] + bbox[3]) / 2
+                            px, py = to_pixel(cx, cy)
+                            logger.debug(f"Pre-input tap at {px},{py}")
+                            self.tap([(px, py)])
+                            time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+                        if bbox:
+                            time.sleep(DEFAULT_PRE_INPUT_DELAY_MS / 1000.0)
                         text_content = str(args[0])
-                        safe_text = shlex.quote(text_content)
-                        is_ascii = text_content.isascii()
-                        if is_ascii:
-                            self._adb_shell(f"input text {safe_text}")
-                        else:
-                            # Use ADBKeyBoard broadcast for non-ASCII (e.g. Chinese)
-                            # Requires ADBKeyBoard to be installed and enabled
-                            # Use base64 to avoid shell encoding issues
-                            b64_encoded = base64.b64encode(text_content.encode('utf-8')).decode('utf-8')
-                            self._adb_shell(f"am broadcast -a ADB_INPUT_B64 --es msg {b64_encoded}", check=False)
+                        # Handle tab/newline using keyevents. Support both literal and escaped forms.
+                        parts = re.split(r"(\\t|\\n|\t|\n)", text_content)
+                        for part in parts:
+                            if part in ("\t", "\\t"):
+                                self._adb_shell("input keyevent KEYCODE_TAB")
+                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
+                                continue
+                            if part in ("\n", "\\n"):
+                                self._adb_shell("input keyevent KEYCODE_ENTER")
+                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
+                                continue
+                            if not part:
+                                continue
+                            safe_text = shlex.quote(part)
+                            is_ascii = part.isascii()
+                            if is_ascii:
+                                self._adb_shell(f"input text {safe_text}")
+                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
+                            else:
+                                # Use ADBKeyBoard broadcast for non-ASCII (e.g. Chinese)
+                                # Requires ADBKeyBoard to be installed and enabled
+                                # Use base64 to avoid shell encoding issues
+                                b64_encoded = base64.b64encode(part.encode('utf-8')).decode('utf-8')
+                                self._adb_shell(f"am broadcast -a ADB_INPUT_B64 --es msg {b64_encoded}", check=False)
+                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
 
                 elif func_name == "text.del" or func_name == "text.clear":
                     # Delete n_char chars

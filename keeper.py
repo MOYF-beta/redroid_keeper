@@ -205,6 +205,25 @@ def _adb_reconnect(adb_port: int, retries: int = 5, delay: float = 2.0) -> None:
   raise RuntimeError(f"ADB connect failed: {target}")
 
 
+def _adb_wait_for_boot(adb_port: int, timeout: int = 120, poll_interval: float = 2.0) -> bool:
+  target = f"127.0.0.1:{adb_port}"
+  logger.info("Waiting for device boot completion: {}", target)
+  start = time.time()
+
+  # First, wait for device to be online
+  _run_cmd(["adb", "-s", target, "wait-for-device"], check=False)
+
+  while time.time() - start < timeout:
+    res = _run_cmd(["adb", "-s", target, "shell", "getprop", "sys.boot_completed"], check=False)
+    if (res.stdout or "").strip() == "1":
+      logger.info("Device boot completed: {}", target)
+      return True
+    time.sleep(poll_interval)
+
+  logger.warning("Boot not completed within timeout for {}", target)
+  return False
+
+
 def _download_file(url: str, dest_path: str) -> None:
   logger.info("Downloading {} to {}", url, dest_path)
   # Use curl to download
@@ -225,6 +244,8 @@ def _ensure_adb_keyboard_apk() -> str:
 def _setup_adb_keyboard(adb_port: int) -> None:
   # Check if installed
   target = f"127.0.0.1:{adb_port}"
+  # Ensure device is online and booted before installing IME
+  _adb_wait_for_boot(adb_port)
   res = _run_cmd(["adb", "-s", target, "shell", "pm", "list", "packages", ADB_KEYBOARD_PKG], check=False)
   if ADB_KEYBOARD_PKG not in (res.stdout or ""):
     logger.info("Installing ADB Keyboard to {}", target)
@@ -272,6 +293,7 @@ def create_device(device: DeviceConfig) -> None:
 
   _run_cmd(cmd)
   _adb_reconnect(device.adb_port)
+  _adb_wait_for_boot(device.adb_port)
   _setup_adb_keyboard(device.adb_port)
 
 
@@ -279,6 +301,7 @@ def start_device(device: DeviceConfig) -> None:
   logger.info("Starting device: {}", device.device_id)
   _run_cmd(["docker", "start", device.container_name])
   _adb_reconnect(device.adb_port)
+  _adb_wait_for_boot(device.adb_port)
   _setup_adb_keyboard(device.adb_port)
 
 
