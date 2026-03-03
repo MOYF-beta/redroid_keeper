@@ -6,82 +6,24 @@ from io import BytesIO
 from typing import Iterable, TYPE_CHECKING, Optional
 
 import ast
-import math
 import os
 import re
-import shlex
 import time
-import base64
 
 from loguru import logger
+from .constants import (
+    DEFAULT_ADB_BASE_PORT,
+    DEFAULT_ADB_HOST,
+    DEFAULT_TOUCH_MARGIN_MS,
+    RECORD_BEFORE,
+    RECORD_TIME,
+    SYSTEM_PROMPT,
+)
+from .tools import get_tool_handler
+from .tools.prototype import CallContext, call as call_tool
+
 if TYPE_CHECKING:
     from PIL import Image
-
-DEFAULT_ADB_BASE_PORT = 5555
-DEFAULT_ADB_HOST = "127.0.0.1"
-DEFAULT_TOUCH_MARGIN_MS = 100
-DEFAULT_KEY_INPUT_MARGIN_MS = 200
-DEFAULT_PRE_INPUT_DELAY_MS = 400
-RECORD_BEFORE = 1  # seconds
-RECORD_TIME = 5   # seconds
-SYSTEM_PROMPT = '''
-你是一个操作Android手机的机器人。理解用户的需求，详细分析截图含有什么元素，按钮，在多轮交互中用下面的工具操作手机以完成任务。如果重复操作了数次没有效果，说明当前操作无法实现目标，需要调整思路。当需要总结内容，确保上下滑动查看并记下全部内容。每获取一些新的信息都立刻以文本形式说出以便后面整合。
-
-请注意考虑一些常识，例如高亮的内容代表已经选中。你应该列出常识，做出思考，再付诸行动。尽可能跳过无用的东西或是登录，尽可能选择有利于隐私的选项。每一轮操作后，若是滑动，你可以在屏幕上看到滑动的轨迹。
-
-下面是你可以使用的工具：
-
-touch工具可以通过bbox检测框操作屏幕:
-
-- touch.tap() # 点按bbox中心
-- touch.long_tap(duration_ms) # 长按bbox中心
-- touch.swipe(duration_ms,direction) # direction 指定极角(度)，在bbox内过目标中心沿指定方向划动。提示：**对于导航类的滑动，检测框往往需要几乎框住整个屏幕**，并且自然滑动是反向的，例如向上滑动屏幕查看下方内容，实际上是手指从屏幕下方向上滑动
-- touch.zoom(duration_ms,scale) # 按照scale沿bbox对角线缩放指定倍数
-- touch.continus.down() # 按下屏幕直到下一次 up调用，在此期间可以用 move_to移动
-- touch.continus.down(hold=True) # 按下屏幕直到下一次 up调用，该状态可以跨越多轮对话保持，适合按压后需要观察变化的场景
-- touch.continus.move_to(duration_ms) # 从当前位置移动到bbox中心
-- touch.continus.up() # 松开
-通过label调用工具touch工具，例如
-{"bbox_2d": [x, y, x, y], "label": "touch.tool_name1(args1) "}
-{"bbox_2d": [x, y, x, y], "label": "touch.tap() "} 点击你选中的检测框中心
-{"bbox_2d": [x, y, x, y], "label": "touch.swipe(duration_ms=500,direction=90) "} 在你选中的检测框内过目标中心向上滑过检测框的高度
-continus状态会被普通操作打断
-
-text工具用于文本输入，尽可能使用此工具，除非必要避免使用屏幕键盘:
-
-- text.input(text:str) # 提示，在输入前一般需要先点击输入框以获取焦点
-- text.del(n_char:int) # 删除光标前n_char个字符，默认为50
-
-dev工具用于设备操作:
-
-- dev.screenshot(output_path:str) # 此工具用于留下证明你操作结果和证明获取信息正确的必要证据
-- cature_evidence(output_path:str, caption:str) # 此工具用于截图，框选证据区域并配一段文本以说明证据区域的内容，caption必填
-- dev.press_home() # 此工具最适合回到桌面
-- dev.press_back() # 此工具用户回到上一个页面
-- dev.press_task() # 此工具用于打开多任务管理界面，连续调用两次可以回到之前的应用
-
-wait工具用于等待:
-- wait(duration_ms)
-
-任务完成后向user返回结果:
-- done(message:str) # 结束当前任务，返回message给user
-
-请以json格式输出调用列表到代码块，工具调用一行一个，这些调用按顺序执行
-为了确保的操作有效，思路清晰，请严格按照下面分割线中的模板输出:
--------------------------------------------------------------
-备忘录: {需要收集并整合的信息，例如{"x":123,"y":"abc"}，上一步的内容也需要完整转录}
-
-现在，我在屏幕上看到了：{屏幕上的各个元素}，我所处的路由{有 or 没有}发生变化，
-当前我的路由是： {xxx应用}-{xxx页面}-{yyy子页面}-{zzz子页面}...
-下面是我的动作对应的工具调用:
-```agent_call
-[
-{"bbox_2d": [100, 200, 300, 400], "label": "tool() # comment 1"},
-{"bbox_2d": [400, 500, 600, 700], "label": "tool(args) # comment 2"}
-]
-```
--------------------------------------------------------------
-'''
 
 
 
@@ -101,7 +43,6 @@ class AGTDevice:
         try:
             import yaml
 
-            # locate device_config.yaml: try repo root next to this package, then CWD
             base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             config_path = os.path.join(base_path, "device_config.yaml")
             if not os.path.exists(config_path):
@@ -148,23 +89,20 @@ class AGTDevice:
     def adb_target(self) -> str:
         return f"{self.adb_host}:{self.adb_port}"
 
-    # Internal maatouch device, created after connect()
     _touch_device: Optional["AGTDevice"] = None
-    # Track holding state
     _is_holding: bool = False
     _hold_locked: bool = False
 
     def is_holding(self) -> bool:
         return getattr(self, "_is_holding", False)
-    
+
     def is_hold_locked(self) -> bool:
         return getattr(self, "_hold_locked", False)
 
     def get_system_prompt(self) -> str:
         prompt = SYSTEM_PROMPT + "\n当前touch.continus.down()激活，你正在持续按压屏幕，只能调用 touch.continus.move_to() 和 wait()，touch.continus.up()松开"
-
         if self.is_hold_locked():
-             prompt += '\n\n正在持续按压屏幕，只能调用 touch.continus.move_to() 和 wait()，touch.continus.up()松开'
+            prompt += "\n\n正在持续按压屏幕，只能调用 touch.continus.move_to() 和 wait()，touch.continus.up()松开"
         return prompt
 
     def _run(self, cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -187,20 +125,15 @@ class AGTDevice:
         for _ in range(retries):
             res = self._run(["adb", "connect", self.adb_target], check=False)
             if "connected" in (res.stdout or "").lower():
-                # After adb connect, create maatouch touch helper so callers can
-                # use `tap`, `swipe`, etc., directly on this object.
                 try:
                     from pymaatouch import MNTDevice as MNTDeviceImpl
 
-                    # create non-frozen attribute via object.__setattr__
                     object.__setattr__(self, "_touch_device", MNTDeviceImpl(self.adb_target))
                 except Exception:
-                    # if maatouch not available or device unreachable, leave touch device None
                     object.__setattr__(self, "_touch_device", None)
                 return
         raise RuntimeError(f"ADB connect failed: {self.adb_target}")
 
-    # Key events
     def key_back(self) -> None:
         self._adb_shell("input keyevent 4")
 
@@ -216,13 +149,11 @@ class AGTDevice:
     def key_volume_down(self) -> None:
         self._adb_shell("input keyevent 25")
 
-    # Touch delegation (powered by pymaatouch.MNTDevice)
     def _ensure_touch(self) -> None:
         if getattr(self, "_touch_device", None) is None:
             try:
                 self.connect()
             except Exception:
-                # fall through to error below
                 pass
         if getattr(self, "_touch_device", None) is None:
             raise RuntimeError("touch device not initialized; call connect() first")
@@ -268,7 +199,6 @@ class AGTDevice:
             except Exception:
                 pass
 
-    # Screenshot
     def screenshot(self) -> "Image.Image":
         cmd = ["adb", "-s", self.adb_target, "exec-out", "screencap", "-p"]
         res = self._run_binary(cmd, check=True)
@@ -276,7 +206,6 @@ class AGTDevice:
 
         return PILImage.open(BytesIO(res.stdout))
 
-    # Focus info
     def get_focus(self) -> dict[str, str]:
         res = self._adb_shell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'", check=False)
         lines = [line.strip() for line in (res.stdout or "").splitlines() if line.strip()]
@@ -286,39 +215,24 @@ class AGTDevice:
             "mFocusedApp": next((l for l in lines if "mFocusedApp" in l), ""),
         }
 
-    # App management
     def _get_main_activity(self, package_name: str) -> str | None:
-        """Find the main launcher activity for the given package."""
-        # Method 1: Use cmd package resolve-activity (reliable on newer Android)
         res = self._adb_shell(f"cmd package resolve-activity --brief {package_name}", check=False)
         if res.returncode == 0 and res.stdout:
             lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
             if lines:
-                # The format is usually:
-                # priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false
-                # com.package/.Activity
                 last_line = lines[-1]
                 if "/" in last_line:
                     return last_line
 
-        # Method 2: Fallback to dumpsys package (common)
         res = self._adb_shell(f"dumpsys package {package_name}", check=False)
         if res.stdout:
-            import re
-
-            # Look for the MAIN action and LAUNCHER category section
-            output = res.stdout
-            # Search for the block starting with android.intent.action.MAIN:
-            # and then find the first activity that follows it before the next action
             main_block_match = re.search(
                 r"android\.intent\.action\.MAIN:(.*?)(?:\w+\.intent\.action|$)",
-                output,
+                res.stdout,
                 re.DOTALL,
             )
             if main_block_match:
                 block = main_block_match.group(1)
-                # In this block, find the activity that has the LAUNCHER category
-                # Line format: <hash> <package>/<activity> filter <hash>
                 if "android.intent.category.LAUNCHER" in block:
                     activity_match = re.search(r"(\S+/\S+)", block)
                     if activity_match:
@@ -349,13 +263,11 @@ class AGTDevice:
         return apps
 
     def launch_app(self, package_name: str) -> None:
-        # Try to find the main activity dynamically
         main_activity = self._get_main_activity(package_name)
 
         if main_activity:
             cmd = f"am start -n {main_activity}"
         else:
-            # Fallback to the old behavior if we couldn't find the activity
             logger.warning(
                 "could not determine main activity for %s, falling back to .MainActivity",
                 package_name,
@@ -365,56 +277,54 @@ class AGTDevice:
         res = self._adb_shell(cmd, check=False)
         if res.returncode != 0:
             logger.warning("failed to start %s: %s %s", package_name, res.stdout, res.stderr)
-    
+
     def agent_call(self, call_string: str, get_video: bool = False) -> str:
         logger.info(f"agent_call: {call_string}")
 
         path_to_video = None
         screen_record_process = None
         remote_video_path = f"/sdcard/record_{int(time.time())}.mp4"
+        errors: list[str] = []
 
         if get_video:
-            # Start recording in the background
             record_cmd = [
                 "adb", "-s", self.adb_target, "shell",
-                "screenrecord", f"--time-limit={int(RECORD_BEFORE + RECORD_TIME)}", remote_video_path
+                "screenrecord", f"--time-limit={int(RECORD_BEFORE + RECORD_TIME)}", remote_video_path,
             ]
             logger.debug(f"Starting screen record: {' '.join(record_cmd)}")
             screen_record_process = subprocess.Popen(record_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             time.sleep(RECORD_BEFORE)
-        
-        # 1. Extract JSON block
+
         json_content = call_string
         code_block_match = re.search(r"```agent_call\s*(.*?)\s*```", call_string, re.DOTALL)
         if code_block_match:
             json_content = code_block_match.group(1)
         else:
-             # Fallback: try finding first [ ... ]
-             json_list_match = re.search(r"(\[.*\])", call_string, re.DOTALL)
-             if json_list_match:
-                 json_content = json_list_match.group(1)
-        
-        # Replace tabs with spaces as YAML does not support tabs for indentation
+            json_list_match = re.search(r"(\[.*\])", call_string, re.DOTALL)
+            if json_list_match:
+                json_content = json_list_match.group(1)
+
         json_content = json_content.replace("\t", "    ")
 
-        # Escape inner quotes in text.input("...") to avoid YAML/JSON parse errors
         def _escape_text_input_quotes(raw: str) -> str:
             pattern = r"text\.input\(\"([^\"]*?)\"\)"
+
             def _repl(m: re.Match[str]) -> str:
                 return f"text.input(\\\"{m.group(1)}\\\")"
+
             return re.sub(pattern, _repl, raw)
 
         json_content = _escape_text_input_quotes(json_content)
 
         try:
-            # use yaml to parse as it's more tolerant of trailing commas/comments
             import yaml
+
             actions = yaml.safe_load(json_content)
         except Exception as e:
             logger.error(f"Parse error: {e}")
             logger.error(f"Failed content: {json_content!r}")
             return "parse error"
-            
+
         if not isinstance(actions, list):
             if isinstance(actions, dict):
                 actions = [actions]
@@ -422,535 +332,107 @@ class AGTDevice:
                 logger.error(f"JSON is not a list or dict: {type(actions)}")
                 return "json formatting error"
 
-        # 2. Execute actions
+        touch_consumers = {
+            "touch.tap", "touch.long_tap", "touch.swipe", "touch.zoom",
+            "touch.continus.down", "touch.continus.move_to",
+        }
+        implicit_tap_exempt = {"cature_evidence", "capture_evidence"}
+
         for action in actions:
-            try:
-                label = action.get("label", "")
-                bbox = action.get("bbox_2d", None)
-                
-                # Strip comments
-                if "#" in label:
-                    label = label.split("#", 1)[0]
-                label = label.strip()
-                
-                # Parse function call: name(args)
-                func_match = re.match(r"^([\w\.]+)\((.*)\)$", label)
-                if not func_match:
-                    logger.warning(f"Skipping invalid label: {label}")
-                    continue
-                
-                func_name, args_str = func_match.groups()
-                
-                # Parse arguments using ast
-                pos_args = ()
-                kw_args = {}
-                if args_str.strip():
-                    try:
-                        # Parse as a call expression: func(args...)
-                        # args_str might be "100" or "hold=True" or "100, 200"
-                        # We construct a dummy call "f(args_str)" to parse it.
-                        tree = ast.parse(f"f({args_str})", mode='eval')
-                        call_node = tree.body
-                        
-                        def _safe_eval(node):
-                            try:
-                                return ast.literal_eval(node)
-                            except ValueError:
-                                if isinstance(node, ast.Name):
-                                    return node.id
-                                raise
+            label = action.get("label", "")
+            bbox = action.get("bbox_2d", None)
 
-                        # Evaluate args
-                        pos_args = tuple(_safe_eval(a) for a in call_node.args)
-                        kw_args = {k.arg: _safe_eval(k.value) for k in call_node.keywords}
-                    except Exception:
-                        logger.warning(f"Failed to parse args with ast: {args_str}, fallback to literal_eval")
+            if "#" in label:
+                label = label.split("#", 1)[0]
+            label = label.strip()
+
+            func_match = re.match(r"^([\w\.]+)\((.*)\)$", label)
+            if not func_match:
+                logger.warning(f"Skipping invalid label: {label}")
+                continue
+
+            func_name, args_str = func_match.groups()
+            pos_args = ()
+            kw_args = {}
+            if args_str.strip():
+                try:
+                    tree = ast.parse(f"f({args_str})", mode="eval")
+                    call_node = tree.body
+
+                    def _safe_eval(node):
                         try:
-                             # Fallback to old behavior for simple tuples
-                             pos_args = ast.literal_eval(f"({args_str},)")
-                        except Exception:
-                             if func_name == "text.input":
-                                 # Allow raw strings for text input if parsing fails (e.g. spaces, special chars)
-                                 pos_args = (args_str,)
-                             else:
-                                 logger.warning(f"Failed to parse args completely: {args_str}")
-                                 continue
+                            return ast.literal_eval(node)
+                        except ValueError:
+                            if isinstance(node, ast.Name):
+                                return node.id
+                            raise
 
-                # Merege args for legacy compatibility (some code uses numerical indexing)
-                args = pos_args 
-
-                logger.debug(f"Executing {func_name} with pos_args={pos_args} kw_args={kw_args} bbox={bbox}")
-
-                # -------------------------------------------------------------
-                # Strict Checking for Hold State
-                # -------------------------------------------------------------
-                if self.is_hold_locked():
-                    allowed_funcs = ["touch.continus.move_to", "touch.continus.up", "wait"]
-                    if func_name not in allowed_funcs:
-                        raise RuntimeError(f"Constraint Violation: Device is in hold state. Only {allowed_funcs} are allowed. Got {func_name}")
-
-                # Auto-release for non-continuous actions (except wait)
-                if getattr(self, "_last_touch_pos", None) and not func_name.startswith("touch.continus") and func_name != "wait":
-                    self.up()
-                    object.__setattr__(self, "_last_touch_pos", None)
-                    object.__setattr__(self, "_is_holding", False)
-                    object.__setattr__(self, "_hold_locked", False)
-
-                # Coordinate Conversion Helper
-                def to_pixel(rel_x, rel_y):
-                    return int(rel_x * self.width / 1000), int(rel_y * self.height / 1000)
-
-                # -------------------------------------------------------------
-                # Implicit Tap Logic & Touch Delay
-                # -------------------------------------------------------------
-                # If a bbox is provided but the function is NOT a touch consumer (e.g. text.input),
-                # perform an implicit tap on the center of the bbox first.
-                did_implicit_tap = False
-                touch_consumers = {
-                    "touch.tap", "touch.long_tap", "touch.swipe", "touch.zoom", 
-                    "touch.continus.down", "touch.continus.move_to"
-                }
-                implicit_tap_exempt = {"cature_evidence", "capture_evidence"}
-                
-                if bbox and func_name not in touch_consumers and func_name not in implicit_tap_exempt:
-                    cx = (bbox[0] + bbox[2]) / 2
-                    cy = (bbox[1] + bbox[3]) / 2
-                    px, py = to_pixel(cx, cy)
-                    logger.debug(f"Implicit tap at {px},{py} for {func_name}")
-                    self.tap([(px, py)])
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
-                    did_implicit_tap = True
-
-                if func_name == "touch.tap":
-                    if bbox:
-                        cx = (bbox[0] + bbox[2]) / 2
-                        cy = (bbox[1] + bbox[3]) / 2
-                        px, py = to_pixel(cx, cy)
-                        self.tap([(px, py)])
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
-                
-                elif func_name == "touch.long_tap":
-                    if bbox:
-                        duration = args[0] if len(args) > 0 else 1000
-                        cx = (bbox[0] + bbox[2]) / 2
-                        cy = (bbox[1] + bbox[3]) / 2
-                        px, py = to_pixel(cx, cy)
-                        self.tap([(px, py)], duration=duration)
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
-                
-                elif func_name == "touch.swipe":
-                    if bbox:
-                        duration = None
-                        direction = None
-                        if len(args) >= 2:
-                            duration = args[0]
-                            direction = args[1]
+                    pos_args = tuple(_safe_eval(a) for a in call_node.args)
+                    kw_args = {k.arg: _safe_eval(k.value) for k in call_node.keywords}
+                except Exception:
+                    logger.warning(f"Failed to parse args with ast: {args_str}, fallback to literal_eval")
+                    try:
+                        pos_args = ast.literal_eval(f"({args_str},)")
+                    except Exception:
+                        if func_name == "text.input":
+                            pos_args = (args_str,)
                         else:
-                            duration = kw_args.get("duration_ms")
-                            direction = kw_args.get("direction")
-
-                        if duration is None or direction is None:
-                            logger.warning("touch.swipe missing duration/direction args: pos_args={} kw_args={}", args, kw_args)
-                            time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+                            logger.warning(f"Failed to parse args completely: {args_str}")
                             continue
 
-                        direction = str(direction).lower()
-                        
-                        angle_map = {
-                            "up": 90,
-                            "down": 270,
-                            "left": 180,
-                            "right": 0
-                        }
-                        
-                        if direction in angle_map:
-                            angle = angle_map[direction]
-                        else:
-                            try:
-                                angle = float(direction)
-                            except ValueError:
-                                angle = 0
-                        
-                        # bbox is [x1, y1, x2, y2]
-                        cx_raw = (bbox[0] + bbox[2]) / 2
-                        cy_raw = (bbox[1] + bbox[3]) / 2
-                        
-                        w_rel = abs(bbox[2] - bbox[0])
-                        h_rel = abs(bbox[3] - bbox[1])
-                        
-                        # Angle to vector
-                        rad = math.radians(angle)
-                        # direction vector
-                        v_x = math.cos(rad)
-                        v_y = -math.sin(rad)
-                        
-                        # Calculate distance to edge (half length of the segment)
-                        # We want to find t such that (cx + t*vx, cy + t*vy) is on the box boundary
-                        # The boundaries are defined by +/- w_rel/2 and +/- h_rel/2 relative to center
-                        
-                        LIMIT_X = w_rel / 2
-                        LIMIT_Y = h_rel / 2
-                        
-                        # Avoid division by zero
-                        # t_x is the distance to travel along V to hit X boundary
-                        if abs(v_x) > 1e-9:
-                            t_x = abs(LIMIT_X / v_x)
-                        else:
-                            t_x = float('inf')
-                            
-                        # t_y is the distance to travel along V to hit Y boundary
-                        if abs(v_y) > 1e-9:
-                            t_y = abs(LIMIT_Y / v_y)
-                        else:
-                            t_y = float('inf')
-                        
-                        # The intersection is limited by the tighter boundary
-                        t = min(t_x, t_y)
-                        
-                        # Full segment vector relative to center is +/- (t * V)
-                        dx = t * v_x
-                        dy = t * v_y
-                        
-                        # Start from one side, go to the other
-                        start_px_py = to_pixel(cx_raw - dx, cy_raw - dy)
-                        end_px_py = to_pixel(cx_raw + dx, cy_raw + dy)
-                        
-                        # Use ext_smooth_swipe for better simulation
-                        # Calculate parts for ~50Hz (20ms) updates if possible
-                        part = max(int(duration / 20), 5)
-                        self.ext_smooth_swipe([start_px_py, end_px_py], duration=duration, part=part)
-                        # Pause at the end point to reduce inertial scrolling
-                        hold_ms = max(int(duration * 0.1), 1)
-                        time.sleep(hold_ms / 1000.0)
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
-                        
-                elif func_name == "touch.zoom":
-                    if bbox and len(args) >= 2:
-                        duration = args[0]
-                        scale = args[1]
-                        
-                        # Zoom uses two points. Diagonal corners
-                        p1 = to_pixel(bbox[0], bbox[1])
-                        p2 = to_pixel(bbox[2], bbox[3])
-                        self.pinch_zoom([p1, p2], scale=scale, duration=duration)
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
-                
-                elif func_name == "touch.continus.down":
-                    if bbox:
-                        if getattr(self, "_last_touch_pos", None):
-                             self.up()
-                             object.__setattr__(self, "_is_holding", False)
-                             object.__setattr__(self, "_hold_locked", False)
+            logger.debug(f"Executing {func_name} with pos_args={pos_args} kw_args={kw_args} bbox={bbox}")
 
-                        cx = (bbox[0] + bbox[2]) / 2
-                        cy = (bbox[1] + bbox[3]) / 2
-                        px, py = to_pixel(cx, cy)
-                        self.tap([(px, py)], no_up=True)
-                        object.__setattr__(self, "_last_touch_pos", (px, py))
-                        object.__setattr__(self, "_is_holding", True)
+            if self.is_hold_locked():
+                allowed_funcs = ["touch.continus.move_to", "touch.continus.up", "wait"]
+                if func_name not in allowed_funcs:
+                    raise RuntimeError(
+                        f"Constraint Violation: Device is in hold state. Only {allowed_funcs} are allowed. Got {func_name}"
+                    )
 
-                        # Check Hold param
-                        hold_val = kw_args.get("hold")
-                        if hold_val is None and len(args) > 0:
-                             if isinstance(args[0], bool):
-                                 hold_val = args[0]
-                        
-                        if hold_val is True:
-                             object.__setattr__(self, "_hold_locked", True)
-                        else:
-                             object.__setattr__(self, "_hold_locked", False)
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+            if getattr(self, "_last_touch_pos", None) and not func_name.startswith("touch.continus") and func_name != "wait":
+                self.up()
+                object.__setattr__(self, "_last_touch_pos", None)
+                object.__setattr__(self, "_is_holding", False)
+                object.__setattr__(self, "_hold_locked", False)
 
-                elif func_name == "touch.continus.move_to":
-                    if bbox:
-                         start_pos = getattr(self, "_last_touch_pos", None)
-                         if not start_pos:
-                             logger.warning("touch.continus.move_to called without active touch")
-                         else:
-                             cx = (bbox[0] + bbox[2]) / 2
-                             cy = (bbox[1] + bbox[3]) / 2
-                             px, py = to_pixel(cx, cy)
-                             
-                             duration = args[0] if len(args) > 0 else 500
-                             self.ext_smooth_swipe([start_pos, (px, py)], duration=duration, no_down=True, no_up=True)
-                             object.__setattr__(self, "_last_touch_pos", (px, py))
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+            did_implicit_tap = False
+            if bbox and func_name not in touch_consumers and func_name not in implicit_tap_exempt:
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                px = int(cx * self.width / 1000)
+                py = int(cy * self.height / 1000)
+                self.tap([(px, py)])
+                time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+                did_implicit_tap = True
 
-                elif func_name == "touch.continus.up":
-                    self.up()
-                    object.__setattr__(self, "_last_touch_pos", None)
-                    object.__setattr__(self, "_is_holding", False)
-                    object.__setattr__(self, "_hold_locked", False)
-                    time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
+            handler = get_tool_handler(func_name)
+            if handler is None:
+                logger.warning(f"Unknown function: {func_name}")
+                continue
 
-                elif func_name == "text.input":
-                    if args:
-                        # For input tasks, always tap the bbox then wait before typing.
-                        if bbox and not did_implicit_tap:
-                            cx = (bbox[0] + bbox[2]) / 2
-                            cy = (bbox[1] + bbox[3]) / 2
-                            px, py = to_pixel(cx, cy)
-                            logger.debug(f"Pre-input tap at {px},{py}")
-                            self.tap([(px, py)])
-                            time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
-                        if bbox:
-                            time.sleep(DEFAULT_PRE_INPUT_DELAY_MS / 1000.0)
-                        text_content = str(args[0])
-                        # Handle tab/newline using keyevents. Support both literal and escaped forms.
-                        parts = re.split(r"(\\t|\\n|\t|\n)", text_content)
-                        for part in parts:
-                            if part in ("\t", "\\t"):
-                                self._adb_shell("input keyevent KEYCODE_TAB")
-                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
-                                continue
-                            if part in ("\n", "\\n"):
-                                self._adb_shell("input keyevent KEYCODE_ENTER")
-                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
-                                continue
-                            if not part:
-                                continue
-                            safe_text = shlex.quote(part)
-                            is_ascii = part.isascii()
-                            if is_ascii:
-                                self._adb_shell(f"input text {safe_text}")
-                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
-                            else:
-                                # Use ADBKeyBoard broadcast for non-ASCII (e.g. Chinese)
-                                # Requires ADBKeyBoard to be installed and enabled
-                                # Use base64 to avoid shell encoding issues
-                                b64_encoded = base64.b64encode(part.encode('utf-8')).decode('utf-8')
-                                self._adb_shell(f"am broadcast -a ADB_INPUT_B64 --es msg {b64_encoded}", check=False)
-                                time.sleep(DEFAULT_KEY_INPUT_MARGIN_MS / 1000.0)
+            ctx = CallContext(
+                device=self,
+                action=action,
+                func_name=func_name,
+                bbox=bbox,
+                args=pos_args,
+                kw_args=kw_args,
+                did_implicit_tap=did_implicit_tap,
+            )
 
-                elif func_name == "text.del" or func_name == "text.clear":
-                    # Delete n_char chars
-                    if func_name == "text.del" and args:
-                        n_char = int(args[0])
-                    else:
-                        n_char = 1
-                        
-                    cmd = "input keyevent 123" # MOVE_END
-                    # Split into chunks to avoid "Argument list too long" if n_char is large
-                    # Max length of command line is limited, but here we concatenate many commands.
-                    # It's safer to loop if n_char is very large, but forreasonable sizes:
-                    
-                    if n_char > 100:
-                         # Process in batches
-                         for _ in range(n_char):
-                             self._adb_shell("input keyevent 67")
-                    else:
-                        for _ in range(n_char):
-                             cmd += "; input keyevent 67" # DEL
-                        self._adb_shell(cmd)
+            result = call_tool(ctx, handler)
+            if not result.ok:
+                if result.exception and "Constraint Violation" in str(result.exception):
+                    raise result.exception
+                msg = result.error_message or f"Error executing action {action}"
+                logger.error(msg)
+                errors.append(msg)
+                continue
 
-                elif func_name == "dev.screenshot":
-                    if args:
-                        path = args[0]
-                        dir_path = os.path.dirname(os.path.abspath(path))
-                        if dir_path:
-                            os.makedirs(dir_path, exist_ok=True)
-                        img = self.screenshot()
-                        img.save(path)
-                        logger.info(f"Screenshot saved to {path}")
-
-                elif func_name == "cature_evidence" or func_name == "capture_evidence":
-                    output_path = None
-                    caption = None
-
-                    if "output_path" in kw_args:
-                        output_path = str(kw_args["output_path"])
-                    if "caption" in kw_args:
-                        caption = str(kw_args["caption"])
-
-                    if len(args) >= 2:
-                        if output_path is None:
-                            output_path = str(args[0])
-                        if caption is None:
-                            caption = str(args[1])
-                    elif len(args) == 1:
-                        # One positional arg is treated as caption for better ergonomics.
-                        if caption is None:
-                            caption = str(args[0])
-
-                    if not output_path:
-                        output_path = os.path.join(os.getcwd(), "logs", f"evidence_{int(time.time() * 1000)}.png")
-
-                    if caption is None or not str(caption).strip():
-                        raise RuntimeError("Constraint Violation: cature_evidence requires a non-empty caption parameter.")
-
-                    dir_path = os.path.dirname(os.path.abspath(output_path))
-                    if dir_path:
-                        os.makedirs(dir_path, exist_ok=True)
-
-                    img = self.screenshot().convert("RGB")
-
-                    if bbox and len(bbox) == 4:
-                        from PIL import ImageDraw
-
-                        x1_raw, y1_raw = to_pixel(bbox[0], bbox[1])
-                        x2_raw, y2_raw = to_pixel(bbox[2], bbox[3])
-                        x1, x2 = sorted((x1_raw, x2_raw))
-                        y1, y2 = sorted((y1_raw, y2_raw))
-
-                        x1 = max(0, min(x1, self.width - 1))
-                        x2 = max(0, min(x2, self.width - 1))
-                        y1 = max(0, min(y1, self.height - 1))
-                        y2 = max(0, min(y2, self.height - 1))
-
-                        if x2 > x1 and y2 > y1:
-                            draw = ImageDraw.Draw(img)
-                            base_w = max(3, int(min(self.width, self.height) * 0.006))
-                            draw.rectangle([(x1, y1), (x2, y2)], outline=(255, 255, 255), width=base_w + 2)
-                            draw.rectangle([(x1, y1), (x2, y2)], outline=(255, 0, 0), width=base_w)
-
-                    from PIL import Image as PILImage
-                    from PIL import ImageDraw, ImageFont
-
-                    def _load_caption_font(font_size: int):
-                        candidates = [
-                            "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
-                            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-                            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-                            "/usr/share/fonts/opentype/noto/NotoSansCJKSC-Regular.otf",
-                            "/usr/share/fonts/truetype/noto/NotoSansCJKSC-Regular.otf",
-                            "/usr/share/fonts/noto/NotoSansSC-Regular.otf",
-                            "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
-                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                        ]
-                        for fp in candidates:
-                            if os.path.exists(fp):
-                                try:
-                                    return ImageFont.truetype(fp, font_size)
-                                except Exception:
-                                    continue
-                        return ImageFont.load_default()
-
-                    def _text_width(text_draw: ImageDraw.ImageDraw, text: str, font) -> int:
-                        bbox_text = text_draw.textbbox((0, 0), text, font=font)
-                        return bbox_text[2] - bbox_text[0]
-
-                    def _choose_font_for_width(text_draw: ImageDraw.ImageDraw, max_width: int, target_chars: int = 50):
-                        # Pick a larger readable font size:
-                        # fit about 50 average English chars per line; Chinese is supported and wrapped.
-                        min_size = 22
-                        max_size = 96
-                        sample_en = ("abcdefghijklmnopqrstuvwxyz" * 2)[:target_chars]
-
-                        chosen = _load_caption_font(min_size)
-                        for size in range(max_size, min_size - 1, -1):
-                            f = _load_caption_font(size)
-                            w = _text_width(text_draw, sample_en, f)
-                            if w <= max_width:
-                                chosen = f
-                                break
-                        return chosen
-
-                    def _wrap_text(text_draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
-                        lines: list[str] = []
-                        for paragraph in str(text).splitlines() or [""]:
-                            if not paragraph:
-                                lines.append("")
-                                continue
-
-                            # Prefer word-wrap for English; fallback to char-wrap for CJK.
-                            units = paragraph.split(" ") if " " in paragraph else list(paragraph)
-                            sep = " " if " " in paragraph else ""
-                            current = ""
-
-                            for unit in units:
-                                candidate = (current + sep + unit) if current else unit
-                                bbox_text = text_draw.textbbox((0, 0), candidate, font=font)
-                                width = bbox_text[2] - bbox_text[0]
-                                if width <= max_width:
-                                    current = candidate
-                                else:
-                                    if current:
-                                        lines.append(current)
-                                    # Extremely long token fallback: split by char
-                                    if sep and text_draw.textbbox((0, 0), unit, font=font)[2] > max_width:
-                                        token_line = ""
-                                        for ch in unit:
-                                            ch_candidate = token_line + ch
-                                            ch_w = text_draw.textbbox((0, 0), ch_candidate, font=font)[2]
-                                            if ch_w <= max_width:
-                                                token_line = ch_candidate
-                                            else:
-                                                if token_line:
-                                                    lines.append(token_line)
-                                                token_line = ch
-                                        current = token_line
-                                    else:
-                                        current = unit
-
-                            if current:
-                                lines.append(current)
-
-                        return lines or [""]
-
-                    pad_x = max(20, int(self.width * 0.03))
-                    pad_y = max(14, int(self.height * 0.012))
-
-                    measure_draw = ImageDraw.Draw(img)
-                    max_text_width = max(50, img.width - pad_x * 2)
-                    font = _choose_font_for_width(measure_draw, max_text_width, target_chars=50)
-                    caption_lines = _wrap_text(measure_draw, str(caption), font, max_text_width)
-
-                    line_bbox = measure_draw.textbbox((0, 0), "Ag测试", font=font)
-                    line_height = max(30, (line_bbox[3] - line_bbox[1]) + 10)
-                    caption_h = pad_y * 2 + line_height * len(caption_lines)
-
-                    canvas = PILImage.new("RGB", (img.width, img.height + caption_h), color=(255, 255, 255))
-                    canvas.paste(img, (0, 0))
-                    canvas_draw = ImageDraw.Draw(canvas)
-
-                    divider_y = img.height
-                    canvas_draw.line([(0, divider_y), (img.width, divider_y)], fill=(220, 220, 220), width=2)
-
-                    y = img.height + pad_y
-                    for line in caption_lines:
-                        canvas_draw.text((pad_x, y), line, font=font, fill=(20, 20, 20))
-                        y += line_height
-
-                    canvas.save(output_path)
-                    logger.info(f"Evidence screenshot saved to {output_path}")
-
-                elif func_name == "dev.get_current_app":
-                    info = self.get_focus()
-                    logger.info(f"Current app info: {info}")
-
-                elif func_name == "dev.launch_app":
-                    if args:
-                        self.launch_app(args[0])
-
-                elif func_name == "dev.press_home":
-                    self.key_home()
-
-                elif func_name == "dev.press_back":
-                    self.key_back()
-
-                elif func_name == "dev.press_task":
-                    # KEYCODE_APP_SWITCH = 187
-                    self._adb_shell("input keyevent 187")
-
-                elif func_name == "wait":
-                    if args:
-                        ms = args[0]
-                        time.sleep(ms / 1000.0)
-
-                elif func_name == "done":
-                    msg = args[0] if args else "task completed"
-                    logger.info(f"Task Done: {msg}")
-                    return f"DONE: {msg}"
-
-                else:
-                    logger.warning(f"Unknown function: {func_name}")
-
-            except Exception as e:
-                # If constraint violation, re-raise to fail the call explicitly
-                if "Constraint Violation" in str(e):
-                    raise e
-                logger.error(f"Error executing action {action}: {e}")
+            if result.done:
+                msg = str(result.value) if result.value is not None else "task completed"
+                logger.info(f"Task Done: {msg}")
+                return f"DONE: {msg}"
         
         # End of actions check: Consistency check
         if self.is_holding() and not self.is_hold_locked():
@@ -991,6 +473,8 @@ class AGTDevice:
             except Exception as e:
                 logger.error(f"Error during video processing: {e}")
 
+        if errors:
+            return f"error: {' | '.join(errors)}", path_to_video
         return "success", path_to_video
 
 
