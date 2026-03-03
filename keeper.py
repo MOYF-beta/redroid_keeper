@@ -80,6 +80,7 @@ class DeviceConfig:
   container_img: str
   screen_resolution: str
   data_snapshot: str | None = None
+  readonly_mount: bool = False
 
   @property
   def adb_port(self) -> int:
@@ -119,12 +120,14 @@ def load_config(config_path: str) -> list[DeviceConfig]:
     container_img = device["container_img"]
     screen_resolution = device["screen_resolution"]
     data_snapshot = device.get("data_snapshot")
+    readonly_mount = device.get("readonly_mount", False)
     devices.append(
       DeviceConfig(
         device_id=device_id,
         container_img=container_img,
         screen_resolution=screen_resolution,
         data_snapshot=data_snapshot,
+        readonly_mount=readonly_mount,
       )
     )
   return devices
@@ -139,18 +142,43 @@ def _parse_resolution(resolution: str) -> tuple[int, int]:
 
 def _ensure_clean_mount_dir(mount_dir: str) -> None:
   if os.path.isdir(mount_dir):
+    # Check if directory is mounted (for readonly squashfs)
+    if _is_mounted(mount_dir):
+      _unmount(mount_dir)
     logger.info("Removing existing mount dir: {}", mount_dir)
     shutil.rmtree(mount_dir)
   os.makedirs(mount_dir, exist_ok=True)
 
 
-def _load_snapshot_if_needed(mount_dir: str, snapshot: str | None) -> None:
+def _load_snapshot_if_needed(mount_dir: str, snapshot: str | None, readonly: bool = False) -> None:
   if not snapshot:
     return
   snapshot_path = os.path.join(IMAGE_BASE, snapshot)
   if not os.path.isfile(snapshot_path):
     raise FileNotFoundError(f"Snapshot not found: {snapshot_path}")
   logger.info("Loading snapshot: {}", snapshot_path)
+  
+  # Support readonly mount for squashfs images
+  lower = snapshot.lower()
+  if readonly and lower.endswith(".sqsh"):
+    squashfuse = shutil.which("squashfuse")
+    if not squashfuse:
+      raise RuntimeError("squashfuse not found. Install squashfuse for readonly mounting")
+    
+    # Ensure mount directory exists and is empty
+    if os.path.isdir(mount_dir) and os.listdir(mount_dir):
+      logger.info("Mount dir not empty, removing: {}", mount_dir)
+      shutil.rmtree(mount_dir)
+    os.makedirs(mount_dir, exist_ok=True)
+    
+    # Mount squashfs image read-only
+    logger.info("Mounting squashfs image read-only: {} -> {}", snapshot_path, mount_dir)
+    res = _run_cmd([squashfuse, snapshot_path, mount_dir, "-o", "ro"], check=False)
+    if res.returncode != 0:
+      logger.error("squashfuse failed: {}", res.stderr)
+      raise RuntimeError(f"squashfuse failed: {res.stderr}")
+    return
+  
   # Support squashfs images (.sqsh) as preferred snapshot format
   lower = snapshot.lower()
   if lower.endswith(".sqsh"):
@@ -265,7 +293,7 @@ def create_device(device: DeviceConfig) -> None:
   logger.info("Creating device: {}", device.device_id)
   _remove_container_if_exists(device.container_name)
   _ensure_clean_mount_dir(device.mount_dir)
-  _load_snapshot_if_needed(device.mount_dir, device.data_snapshot)
+  _load_snapshot_if_needed(device.mount_dir, device.data_snapshot, device.readonly_mount)
 
   width, height = _parse_resolution(device.screen_resolution)
   android_args = DEFAULT_ANDROID_ARGS + [
@@ -305,10 +333,28 @@ def start_device(device: DeviceConfig) -> None:
   _setup_adb_keyboard(device.adb_port)
 
 
+def _is_mounted(mount_dir: str) -> bool:
+  """Check if a directory is mounted."""
+  try:
+    res = _run_cmd(["mount"], check=False)
+    return mount_dir in res.stdout
+  except Exception:
+    return False
+
+
+def _unmount(mount_dir: str) -> None:
+  """Unmount a directory."""
+  logger.info("Unmounting: {}", mount_dir)
+  _run_cmd(["umount", mount_dir], check=False)
+
+
 def remove_device(device: DeviceConfig) -> None:
   logger.info("Removing device: {}", device.device_id)
   _remove_container_if_exists(device.container_name)
   if os.path.isdir(device.mount_dir):
+    # Check if directory is mounted (for readonly squashfs)
+    if _is_mounted(device.mount_dir):
+      _unmount(device.mount_dir)
     logger.info("Removing mount dir: {}", device.mount_dir)
     shutil.rmtree(device.mount_dir)
 
