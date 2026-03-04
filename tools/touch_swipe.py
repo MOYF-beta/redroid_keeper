@@ -4,7 +4,35 @@ import math
 import time
 
 from ..constants import DEFAULT_TOUCH_MARGIN_MS
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec, ToolValidationError
+
+
+def _validate_swipe(ctx: CallContext) -> None:
+    duration = ctx.args[0] if len(ctx.args) >= 1 else ctx.kw_args.get("duration_ms")
+    direction = ctx.args[1] if len(ctx.args) >= 2 else ctx.kw_args.get("direction")
+    if duration is None or direction is None:
+        raise ToolValidationError("MissingRequiredArgument", "touch.swipe requires duration_ms and direction")
+    if not isinstance(duration, (int, float)):
+        raise ToolValidationError("InvalidArgumentType", f"duration_ms expects int|float, got {type(duration).__name__}")
+    if not isinstance(direction, (int, float, str)):
+        raise ToolValidationError("InvalidArgumentType", f"direction expects int|float|str, got {type(direction).__name__}")
+
+
+METHOD_SPEC = MethodSpec(
+    name="touch.swipe",
+    summary="Swipe across bbox center with angle direction.",
+    args=[
+        ArgSpec("duration_ms", "int|float", "Swipe duration in milliseconds.", required=False, py_types=(int, float)),
+        ArgSpec("direction", "int|float|str", "Direction angle in degrees or up/down/left/right.", required=False, py_types=(int, float, str)),
+    ],
+    kwargs={
+        "duration_ms": ArgSpec("duration_ms", "int|float", "Swipe duration in milliseconds.", required=False, py_types=(int, float)),
+        "direction": ArgSpec("direction", "int|float|str", "Direction angle in degrees or up/down/left/right.", required=False, py_types=(int, float, str)),
+    },
+    require_bbox=True,
+    example='{"bbox_2d": [0, 0, 1000, 1000], "label": "touch.swipe(duration_ms=500,direction=90)"}',
+    custom_validator=_validate_swipe,
+)
 
 
 def execute(ctx: CallContext) -> None:

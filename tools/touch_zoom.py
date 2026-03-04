@@ -3,7 +3,19 @@ from __future__ import annotations
 import time
 
 from ..constants import DEFAULT_TOUCH_MARGIN_MS
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="touch.zoom",
+    summary="Pinch zoom using bbox diagonal endpoints.",
+    args=[
+        ArgSpec("duration_ms", "int|float", "Zoom duration in milliseconds.", py_types=(int, float)),
+        ArgSpec("scale", "int|float", "Zoom scale factor, >1 zoom in, <1 zoom out.", py_types=(int, float)),
+    ],
+    require_bbox=True,
+    example='{"bbox_2d": [100, 200, 200, 400], "label": "touch.zoom(500,1.2)"}',
+)
 
 
 def execute(ctx: CallContext) -> None:

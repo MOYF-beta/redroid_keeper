@@ -3,7 +3,45 @@ from __future__ import annotations
 import os
 import time
 
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec, ToolValidationError
+
+
+def _validate_capture(ctx: CallContext) -> None:
+    if len(ctx.args) > 2:
+        raise ToolValidationError("TooManyPositionalArguments", "capture_evidence accepts at most 2 positional args")
+
+    output_path = ctx.kw_args.get("output_path")
+    caption = ctx.kw_args.get("caption")
+
+    if len(ctx.args) >= 1 and output_path is None and caption is None:
+        # single positional is treated as caption; 2 positional -> path,caption
+        caption = ctx.args[0] if len(ctx.args) == 1 else ctx.args[1]
+    elif len(ctx.args) >= 2:
+        if output_path is None:
+            output_path = ctx.args[0]
+        if caption is None:
+            caption = ctx.args[1]
+
+    if output_path is not None and not isinstance(output_path, str):
+        raise ToolValidationError("InvalidArgumentType", f"output_path expects str, got {type(output_path).__name__}")
+    if caption is None or not str(caption).strip():
+        raise ToolValidationError("MissingRequiredArgument", "caption is required and must be non-empty")
+
+
+METHOD_SPEC = MethodSpec(
+    name="cature_evidence|capture_evidence",
+    summary="Capture screenshot with highlighted bbox and caption text.",
+    args=[
+        ArgSpec("output_path", "str", "Output image path.", required=False, py_types=(str,)),
+        ArgSpec("caption", "str", "Caption text describing evidence.", required=False, py_types=(str,)),
+    ],
+    kwargs={
+        "output_path": ArgSpec("output_path", "str", "Output image path.", required=False, py_types=(str,)),
+        "caption": ArgSpec("caption", "str", "Caption text describing evidence.", required=False, py_types=(str,)),
+    },
+    example='{"bbox_2d": [100,200,500,600], "label": "cature_evidence(output_path=\"logs/evidence.png\", caption=\"这是证据\")"}',
+    custom_validator=_validate_capture,
+)
 
 
 def execute(ctx: CallContext) -> None:
@@ -24,7 +62,11 @@ def execute(ctx: CallContext) -> None:
         caption = str(ctx.args[0])
 
     if not output_path:
-        output_path = os.path.join(os.getcwd(), "logs", f"evidence_{int(time.time() * 1000)}.png")
+        recorder = getattr(ctx.device, "_trajectory_recorder", None)
+        if recorder is not None:
+            output_path = os.path.join(recorder.evidence_dir, f"evidence_{int(time.time() * 1000)}.png")
+        else:
+            output_path = os.path.join(os.getcwd(), "logs", f"evidence_{int(time.time() * 1000)}.png")
 
     if caption is None or not str(caption).strip():
         raise RuntimeError("Constraint Violation: cature_evidence requires a non-empty caption parameter.")
@@ -160,3 +202,4 @@ def execute(ctx: CallContext) -> None:
         y += line_height
 
     canvas.save(output_path)
+    return output_path

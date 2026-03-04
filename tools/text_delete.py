@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="text.del|text.clear",
+    summary="Delete characters before cursor.",
+    args=[ArgSpec("n_char", "int", "Number of chars to delete.", required=False, py_types=(int,), default=1)],
+    example='{"label": "text.del(10)"}',
+)
 
 
 def execute(ctx: CallContext) -> None:

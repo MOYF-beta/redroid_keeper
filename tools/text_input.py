@@ -10,7 +10,16 @@ from ..constants import (
     DEFAULT_PRE_INPUT_DELAY_MS,
     DEFAULT_TOUCH_MARGIN_MS,
 )
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="text.input",
+    summary="Input text into focused input field.",
+    args=[ArgSpec("text", "str", "Text to input. Supports tab/newline escape.", py_types=(str,))],
+    require_bbox=False,
+    example='{"bbox_2d": [120, 300, 900, 360], "label": "text.input(\"hello\")"}',
+)
 
 
 def execute(ctx: CallContext) -> None:

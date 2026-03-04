@@ -3,7 +3,18 @@ from __future__ import annotations
 import time
 
 from ..constants import DEFAULT_TOUCH_MARGIN_MS
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="touch.continus.move_to",
+    summary="Move active continuous touch to bbox center.",
+    args=[
+        ArgSpec("duration_ms", "int|float", "Movement duration in milliseconds.", required=False, py_types=(int, float), default=500)
+    ],
+    require_bbox=True,
+    example='{"bbox_2d": [200, 300, 400, 500], "label": "touch.continus.move_to(500)"}',
+)
 
 
 def execute(ctx: CallContext) -> None:

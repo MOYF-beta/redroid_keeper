@@ -3,7 +3,14 @@ from __future__ import annotations
 import time
 
 from ..constants import DEFAULT_TOUCH_MARGIN_MS
-from .prototype import CallContext
+from .prototype import CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="touch.continus.up",
+    summary="Release active continuous touch.",
+    example='{"label": "touch.continus.up()"}',
+)
 
 
 def execute(ctx: CallContext) -> None:

@@ -3,7 +3,21 @@ from __future__ import annotations
 import time
 
 from ..constants import DEFAULT_TOUCH_MARGIN_MS
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="touch.continus.down",
+    summary="Press and hold at bbox center.",
+    args=[
+        ArgSpec("hold", "bool", "If true, allow hold state to persist across rounds.", required=False, py_types=(bool,), default=False)
+    ],
+    kwargs={
+        "hold": ArgSpec("hold", "bool", "If true, allow hold state to persist across rounds.", required=False, py_types=(bool,), default=False)
+    },
+    require_bbox=True,
+    example='{"bbox_2d": [100, 200, 300, 400], "label": "touch.continus.down(hold=True)"}',
+)
 
 
 def execute(ctx: CallContext) -> None:

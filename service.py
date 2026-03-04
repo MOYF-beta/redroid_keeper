@@ -8,6 +8,7 @@ from typing import Iterable, TYPE_CHECKING, Optional
 import ast
 import os
 import re
+import shutil
 import time
 
 from loguru import logger
@@ -19,8 +20,9 @@ from .constants import (
     RECORD_TIME,
     SYSTEM_PROMPT,
 )
-from .tools import get_tool_handler
+from .tools import get_tool_entry
 from .tools.prototype import CallContext, call as call_tool
+from .trajectory import ToolCallTrajectory
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -92,6 +94,7 @@ class AGTDevice:
     _touch_device: Optional["AGTDevice"] = None
     _is_holding: bool = False
     _hold_locked: bool = False
+    _trajectory_recorder: Optional[ToolCallTrajectory] = None
 
     def is_holding(self) -> bool:
         return getattr(self, "_is_holding", False)
@@ -278,13 +281,83 @@ class AGTDevice:
         if res.returncode != 0:
             logger.warning("failed to start %s: %s %s", package_name, res.stdout, res.stderr)
 
-    def agent_call(self, call_string: str, get_video: bool = False) -> str:
+    def init_trajectory_recording(self, output_dir: str | None = None, session_name: str | None = None) -> str:
+        base_dir = output_dir or os.path.join(os.getcwd(), "logs")
+        recorder = ToolCallTrajectory(root_dir=base_dir, session_name=session_name)
+        object.__setattr__(self, "_trajectory_recorder", recorder)
+        logger.info(f"Trajectory recording started: {recorder.session_dir}")
+        return recorder.session_dir
+
+    def finish_trajectory_recording(self) -> str | None:
+        recorder = getattr(self, "_trajectory_recorder", None)
+        if recorder is None:
+            return None
+        json_path = recorder.finish()
+        object.__setattr__(self, "_trajectory_recorder", None)
+        logger.info(f"Trajectory recording finished: {json_path}")
+        return json_path
+
+    def replay_trajectory(self, trajectory_path_or_dir: str, respect_interval: bool = True) -> list[tuple[str, str | None]]:
+        batches = ToolCallTrajectory.load_batches(trajectory_path_or_dir)
+        replay_results: list[tuple[str, str | None]] = []
+        for batch in batches:
+            call_string = str(batch.get("call_string", ""))
+            get_video = bool(batch.get("get_video", False))
+            replay_results.append(self.agent_call(call_string, get_video=get_video))
+            if respect_interval:
+                interval = batch.get("interval_to_next_batch_sec")
+                if isinstance(interval, (int, float)) and interval > 0:
+                    time.sleep(interval)
+        return replay_results
+
+    def _record_trajectory_batch(
+        self,
+        *,
+        started_at: float,
+        ended_at: float,
+        call_string: str,
+        get_video: bool,
+        tool_returns: list[dict],
+        status_type: str,
+        status_src_path: str | None,
+        evidence_paths: list[str],
+    ) -> None:
+        recorder = getattr(self, "_trajectory_recorder", None)
+        if recorder is None:
+            return
+
+        status_image = None
+        if not status_src_path:
+            try:
+                status_image = self.screenshot().convert("RGB")
+                status_type = "image"
+            except Exception as e:
+                logger.warning(f"Failed to capture status screenshot for trajectory: {e}")
+                status_type = "none"
+
+        recorder.add_batch(
+            started_at=started_at,
+            ended_at=ended_at,
+            call_string=call_string,
+            get_video=get_video,
+            tool_returns=tool_returns,
+            status_type=status_type,
+            status_src_path=status_src_path,
+            status_image=status_image,
+            evidence_src_paths=evidence_paths,
+        )
+
+    def agent_call(self, call_string: str, get_video: bool = False) -> tuple[str, str | None]:
         logger.info(f"agent_call: {call_string}")
+        started_at = time.time()
 
         path_to_video = None
         screen_record_process = None
         remote_video_path = f"/sdcard/record_{int(time.time())}.mp4"
         errors: list[str] = []
+        tool_returns: list[dict] = []
+        evidence_paths: list[str] = []
+        final_status = "success"
 
         if get_video:
             record_cmd = [
@@ -323,14 +396,36 @@ class AGTDevice:
         except Exception as e:
             logger.error(f"Parse error: {e}")
             logger.error(f"Failed content: {json_content!r}")
-            return "parse error"
+            ended_at = time.time()
+            self._record_trajectory_batch(
+                started_at=started_at,
+                ended_at=ended_at,
+                call_string=call_string,
+                get_video=get_video,
+                tool_returns=[{"error": f"parse error: {e}"}],
+                status_type="none",
+                status_src_path=None,
+                evidence_paths=[],
+            )
+            return "parse error", None
 
         if not isinstance(actions, list):
             if isinstance(actions, dict):
                 actions = [actions]
             else:
                 logger.error(f"JSON is not a list or dict: {type(actions)}")
-                return "json formatting error"
+                ended_at = time.time()
+                self._record_trajectory_batch(
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    call_string=call_string,
+                    get_video=get_video,
+                    tool_returns=[{"error": "json formatting error"}],
+                    status_type="none",
+                    status_src_path=None,
+                    evidence_paths=[],
+                )
+                return "json formatting error", None
 
         touch_consumers = {
             "touch.tap", "touch.long_tap", "touch.swipe", "touch.zoom",
@@ -405,9 +500,15 @@ class AGTDevice:
                 time.sleep(DEFAULT_TOUCH_MARGIN_MS / 1000.0)
                 did_implicit_tap = True
 
-            handler = get_tool_handler(func_name)
-            if handler is None:
+            entry = get_tool_entry(func_name)
+            if entry is None:
                 logger.warning(f"Unknown function: {func_name}")
+                tool_returns.append({
+                    "func_name": func_name,
+                    "ok": False,
+                    "error": "unknown function",
+                    "action": action,
+                })
                 continue
 
             ctx = CallContext(
@@ -420,7 +521,23 @@ class AGTDevice:
                 did_implicit_tap=did_implicit_tap,
             )
 
-            result = call_tool(ctx, handler)
+            result = call_tool(ctx, entry.handler, spec=entry.spec)
+            tool_record = {
+                "func_name": func_name,
+                "ok": result.ok,
+                "action": action,
+                "did_implicit_tap": did_implicit_tap,
+            }
+            if result.value is not None:
+                tool_record["value"] = result.value
+            if result.error_message:
+                tool_record["error"] = result.error_message
+            tool_returns.append(tool_record)
+
+            if result.ok and isinstance(result.value, str):
+                if func_name in {"capture_evidence", "cature_evidence"}:
+                    evidence_paths.append(result.value)
+
             if not result.ok:
                 if result.exception and "Constraint Violation" in str(result.exception):
                     raise result.exception
@@ -432,7 +549,8 @@ class AGTDevice:
             if result.done:
                 msg = str(result.value) if result.value is not None else "task completed"
                 logger.info(f"Task Done: {msg}")
-                return f"DONE: {msg}"
+                final_status = f"DONE: {msg}"
+                break
         
         # End of actions check: Consistency check
         if self.is_holding() and not self.is_hold_locked():
@@ -473,9 +591,22 @@ class AGTDevice:
             except Exception as e:
                 logger.error(f"Error during video processing: {e}")
 
+        ended_at = time.time()
+        status_type = "video" if path_to_video else "image"
+        self._record_trajectory_batch(
+            started_at=started_at,
+            ended_at=ended_at,
+            call_string=call_string,
+            get_video=get_video,
+            tool_returns=tool_returns,
+            status_type=status_type,
+            status_src_path=path_to_video,
+            evidence_paths=evidence_paths,
+        )
+
         if errors:
             return f"error: {' | '.join(errors)}", path_to_video
-        return "success", path_to_video
+        return final_status, path_to_video
 
 
 def _parse_packages(output: str | None) -> list[str]:

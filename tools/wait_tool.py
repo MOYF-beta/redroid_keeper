@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import time
 
-from .prototype import CallContext
+from .prototype import ArgSpec, CallContext, MethodSpec
+
+
+METHOD_SPEC = MethodSpec(
+    name="wait",
+    summary="Sleep for given duration.",
+    args=[ArgSpec("duration_ms", "int|float", "Wait milliseconds.", required=False, py_types=(int, float), default=0)],
+    example='{"label": "wait(1000)"}',
+)
 
 
 def execute(ctx: CallContext) -> None:
