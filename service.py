@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Iterable, TYPE_CHECKING, Optional
+from typing import Iterable, TYPE_CHECKING, Optional, Any
 
 import ast
 import os
@@ -347,7 +347,12 @@ class AGTDevice:
             evidence_src_paths=evidence_paths,
         )
 
-    def agent_call(self, call_string: str, get_video: bool = False) -> tuple[str, str | None]:
+    def agent_call(
+        self,
+        call_string: str,
+        get_video: bool = False,
+        return_details: bool = False,
+    ) -> tuple[str, str | None] | tuple[str, str | None, dict[str, Any]]:
         logger.info(f"agent_call: {call_string}")
         started_at = time.time()
 
@@ -407,6 +412,17 @@ class AGTDevice:
                 status_src_path=None,
                 evidence_paths=[],
             )
+            details = {
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_sec": round(max(0.0, ended_at - started_at), 3),
+                "tool_returns": [{"error": f"parse error: {e}"}],
+                "status_type": "none",
+                "status_src_path": None,
+                "evidence_paths": [],
+            }
+            if return_details:
+                return "parse error", None, details
             return "parse error", None
 
         if not isinstance(actions, list):
@@ -425,6 +441,17 @@ class AGTDevice:
                     status_src_path=None,
                     evidence_paths=[],
                 )
+                details = {
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "duration_sec": round(max(0.0, ended_at - started_at), 3),
+                    "tool_returns": [{"error": "json formatting error"}],
+                    "status_type": "none",
+                    "status_src_path": None,
+                    "evidence_paths": [],
+                }
+                if return_details:
+                    return "json formatting error", None, details
                 return "json formatting error", None
 
         touch_consumers = {
@@ -604,9 +631,19 @@ class AGTDevice:
             evidence_paths=evidence_paths,
         )
 
-        if errors:
-            return f"error: {' | '.join(errors)}", path_to_video
-        return final_status, path_to_video
+        status_value = f"error: {' | '.join(errors)}" if errors else final_status
+        details = {
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_sec": round(max(0.0, ended_at - started_at), 3),
+            "tool_returns": tool_returns,
+            "status_type": status_type,
+            "status_src_path": path_to_video,
+            "evidence_paths": evidence_paths,
+        }
+        if return_details:
+            return status_value, path_to_video, details
+        return status_value, path_to_video
 
 
 def _parse_packages(output: str | None) -> list[str]:
