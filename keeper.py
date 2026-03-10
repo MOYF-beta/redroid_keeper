@@ -67,11 +67,29 @@ DEFAULT_DOCKER_SHM_SIZE = "2g"
 DEFAULT_GPU_MODE = "guest"
 DEFAULT_ADB_BASE_PORT = 5555
 DEFAULT_CONTAINER_NAME_PREFIX = "redroid"
+DEFAULT_ARM_COMPATIBILITY = "libhoudini"
 
-DEFAULT_ANDROID_ARGS = [
-  "ro.enable.native.bridge.exec64=1",
-  "ro.dalvik.vm.native.bridge=libhoudini.so",
-]
+ARM_COMPATIBILITY_CHOICES = {"libhoudini", "libndk", "none"}
+
+ARM_COMPATIBILITY_ANDROID_ARGS = {
+  "libhoudini": [
+    "ro.enable.native.bridge.exec64=1",
+    "ro.dalvik.vm.native.bridge=libhoudini.so",
+  ],
+  "libndk": [
+    "ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi",
+    "ro.product.cpu.abilist64=x86_64,arm64-v8a",
+    "ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi",
+    "ro.dalvik.vm.isa.arm=x86",
+    "ro.dalvik.vm.isa.arm64=x86_64",
+    "ro.enable.native.bridge.exec=1",
+    "ro.vendor.enable.native.bridge.exec=1",
+    "ro.vendor.enable.native.bridge.exec64=1",
+    "ro.dalvik.vm.native.bridge=libndk_translation.so",
+    "ro.ndk_translation.version=0.2.3",
+  ],
+  "none": [],
+}
 
 
 @dataclass(frozen=True)
@@ -81,6 +99,8 @@ class DeviceConfig:
   screen_resolution: str
   data_snapshot: str | None = None
   readonly_mount: bool = False
+  arm_compatibility: str = DEFAULT_ARM_COMPATIBILITY
+  no_destory: bool = False
 
   @property
   def adb_port(self) -> int:
@@ -121,6 +141,14 @@ def load_config(config_path: str) -> list[DeviceConfig]:
     screen_resolution = device["screen_resolution"]
     data_snapshot = device.get("data_snapshot")
     readonly_mount = device.get("readonly_mount", False)
+    # keep compatibility with requested key name `no_destory`
+    no_destory = bool(device.get("no_destory", device.get("no_destroy", False)))
+    arm_compatibility = str(device.get("arm_compatibility", DEFAULT_ARM_COMPATIBILITY)).strip().lower()
+    if arm_compatibility not in ARM_COMPATIBILITY_CHOICES:
+      raise ValueError(
+        f"Invalid arm_compatibility for device {device_id}: {arm_compatibility}. "
+        f"Supported values: {sorted(ARM_COMPATIBILITY_CHOICES)}"
+      )
     devices.append(
       DeviceConfig(
         device_id=device_id,
@@ -128,6 +156,8 @@ def load_config(config_path: str) -> list[DeviceConfig]:
         screen_resolution=screen_resolution,
         data_snapshot=data_snapshot,
         readonly_mount=readonly_mount,
+        arm_compatibility=arm_compatibility,
+        no_destory=no_destory,
       )
     )
   return devices
@@ -296,7 +326,7 @@ def create_device(device: DeviceConfig) -> None:
   _load_snapshot_if_needed(device.mount_dir, device.data_snapshot, device.readonly_mount)
 
   width, height = _parse_resolution(device.screen_resolution)
-  android_args = DEFAULT_ANDROID_ARGS + [
+  android_args = ARM_COMPATIBILITY_ANDROID_ARGS[device.arm_compatibility] + [
     f"androidboot.redroid_gpu_mode={DEFAULT_GPU_MODE}",
     f"androidboot.redroid_width={width}",
     f"androidboot.redroid_height={height}",
@@ -306,7 +336,6 @@ def create_device(device: DeviceConfig) -> None:
     "docker",
     "run",
     "-d",
-    "--rm",
     "--privileged",
     "--shm-size",
     DEFAULT_DOCKER_SHM_SIZE,
@@ -318,6 +347,9 @@ def create_device(device: DeviceConfig) -> None:
     f"{device.adb_port}:5555",
     device.container_img,
   ] + android_args
+
+  if not device.no_destory:
+    cmd.insert(3, "--rm")
 
   _run_cmd(cmd)
   _adb_reconnect(device.adb_port)

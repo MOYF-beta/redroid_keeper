@@ -507,9 +507,19 @@ class AGTDevice:
             if self.is_hold_locked():
                 allowed_funcs = ["touch.continus.move_to", "touch.continus.up", "wait"]
                 if func_name not in allowed_funcs:
-                    raise RuntimeError(
-                        f"Constraint Violation: Device is in hold state. Only {allowed_funcs} are allowed. Got {func_name}"
+                    msg = (
+                        f"Constraint Violation: Device is in hold state. "
+                        f"Only {allowed_funcs} are allowed. Got {func_name}"
                     )
+                    logger.error(msg)
+                    errors.append(msg)
+                    tool_returns.append({
+                        "func_name": func_name,
+                        "ok": False,
+                        "error": msg,
+                        "action": action,
+                    })
+                    break
 
             if getattr(self, "_last_touch_pos", None) and not func_name.startswith("touch.continus") and func_name != "wait":
                 self.up()
@@ -566,8 +576,6 @@ class AGTDevice:
                     evidence_paths.append(result.value)
 
             if not result.ok:
-                if result.exception and "Constraint Violation" in str(result.exception):
-                    raise result.exception
                 msg = result.error_message or f"Error executing action {action}"
                 logger.error(msg)
                 errors.append(msg)
@@ -586,7 +594,17 @@ class AGTDevice:
              object.__setattr__(self, "_last_touch_pos", None)
              object.__setattr__(self, "_is_holding", False)
              object.__setattr__(self, "_hold_locked", False)
-             raise RuntimeError("Constraint Violation: touch.continus.down() used without hold=True must be closed by touch.continus.up() within the same agent_call.")
+             msg = (
+                 "Constraint Violation: touch.continus.down() used without hold=True "
+                 "must be closed by touch.continus.up() within the same agent_call."
+             )
+             logger.error(msg)
+             errors.append(msg)
+             tool_returns.append({
+                 "func_name": "touch.continus.down",
+                 "ok": False,
+                 "error": msg,
+             })
 
         if screen_record_process:
             # Wait for recording to finish

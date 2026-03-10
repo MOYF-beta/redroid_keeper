@@ -60,8 +60,8 @@ wait工具用于等待:
 下面是我的动作对应的工具调用:
 ```agent_call
 [
-{"bbox_2d": [100, 200, 300, 400], "label": "tool() # comment 1"},
-{"bbox_2d": [400, 500, 600, 700], "label": "tool(args) # comment 2"}
+{"bbox_2d": [x1, y1, x2, y2], "label": "tool() # comment 1"},
+{"bbox_2d": [x1, y1, x2, y2], "label": "tool(args) # comment 2"}
 ]
 ```
 -------------------------------------------------------------
