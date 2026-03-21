@@ -17,9 +17,9 @@ docker run -itd --rm --privileged --shm-size=2g \
 
 创建，启动，移除容器，为不同container管理data挂载点以data快照。提供python函数接口和命令行接口。配置应该由yaml文件提供，格式参考device_config.yaml
 
-默认挂载点/root/redroid_data，每个设备按id创建一个子目录作为挂载点，设备移除后释放,若设备初始化时存在目录，首先将其移除
+默认挂载点/data/redroid/android_data，每个设备按id创建一个子目录作为挂载点，设备移除后释放,若设备初始化时存在目录，首先将其移除
 
-默认data镜像存放点/root/redroid_images，镜像被打包成xxx.tar.gz文件
+默认data镜像存放点/data/redroid/images，镜像被打包成xxx.tar.gz或.sqsh文件
 
 快照手动创建，此程序只需要管理加载，在使用指北中提供一个创建镜像用的linux命令
 若在创建容器时指定快照，读取并加载镜像（解压到data挂载点）
@@ -55,8 +55,9 @@ from loguru import logger
 import sys
 import shutil as _shutil
 
-DATA_MOUNT_BASE = "/root/redroid_data"
-IMAGE_BASE = "/root/redroid_images"
+DATA_ROOT_BASE = "/data/redroid"
+DATA_MOUNT_BASE = os.path.join(DATA_ROOT_BASE, "android_data")
+IMAGE_BASE = os.path.join(DATA_ROOT_BASE, "images")
 
 ADB_KEYBOARD_APK_NAME = "ADBKeyBoard.apk"
 ADB_KEYBOARD_URL = "https://github.com/senzhk/ADBKeyBoard/releases/download/v2.4-dev/keyboardservice-debug.apk"
@@ -117,7 +118,29 @@ class DeviceConfig:
 
 def _run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
   logger.debug("Running command: {}", " ".join(cmd))
-  return subprocess.run(cmd, check=check, text=True, capture_output=True)
+  res = subprocess.run(cmd, check=False, text=True, capture_output=True)
+  if res.returncode != 0 and check:
+    stderr = (res.stderr or "").strip()
+    stdout = (res.stdout or "").strip()
+    logger.error(
+      "Command failed (exit={}): {}\nstdout: {}\nstderr: {}",
+      res.returncode,
+      " ".join(cmd),
+      stdout,
+      stderr,
+    )
+    raise RuntimeError(
+      f"Command failed (exit={res.returncode}): {' '.join(cmd)}\n"
+      f"stdout: {stdout}\n"
+      f"stderr: {stderr}"
+    )
+  return res
+
+
+def _ensure_storage_layout() -> None:
+  """Ensure storage layout exists under /data/redroid."""
+  os.makedirs(DATA_MOUNT_BASE, exist_ok=True)
+  os.makedirs(IMAGE_BASE, exist_ok=True)
 
 
 def _safe_extract_tar(tar_path: str, dest_dir: str) -> None:
@@ -320,6 +343,7 @@ def _setup_adb_keyboard(adb_port: int) -> None:
 
 
 def create_device(device: DeviceConfig) -> None:
+  _ensure_storage_layout()
   logger.info("Creating device: {}", device.device_id)
   _remove_container_if_exists(device.container_name)
   _ensure_clean_mount_dir(device.mount_dir)
@@ -358,6 +382,7 @@ def create_device(device: DeviceConfig) -> None:
 
 
 def start_device(device: DeviceConfig) -> None:
+  _ensure_storage_layout()
   logger.info("Starting device: {}", device.device_id)
   _run_cmd(["docker", "start", device.container_name])
   _adb_reconnect(device.adb_port)
@@ -453,6 +478,7 @@ def main() -> int:
       return 1
   parser = _build_parser()
   args = parser.parse_args()
+  _ensure_storage_layout()
   devices = load_config(args.config)
   selected = _filter_devices(devices, args.ids)
 
