@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
 
@@ -114,7 +114,7 @@ function appendFrameFromState(dev, st) {{
 }}
 
 function parseDirection(label) {{
-  const m = String(label || '').match(/direction\s*=\s*(-?\d+(?:\.\d+)?)/i);
+  const m = String(label || '').match(/direction\\s*=\\s*(-?\\d+(?:\\.\\d+)?)/i);
   if (!m) return null;
   return Number(m[1]);
 }}
@@ -303,11 +303,26 @@ connectWs();
 </body></html>"""
 
 
-def run_monitor_ui(host: str, port: int, ws_port: int) -> ThreadingHTTPServer:
+def run_monitor_ui(host: str, port: int, ws_port: int, service=None) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
             path = parsed.path
+            query = parse_qs(parsed.query or "")
+
+            def _q_bool(name: str, default: bool = False) -> bool:
+                raw = query.get(name, [str(default)])[0].strip().lower()
+                return raw in {"1", "true", "yes", "y", "on"}
+
+            def _q_int(name: str):
+                raw = query.get(name, [""])[0].strip()
+                if not raw:
+                    return None
+                try:
+                    return int(raw)
+                except Exception:
+                    return None
+
             if path == "/" or path == "/index.html":
                 body = _monitor_html(ws_port=ws_port).encode("utf-8")
                 self.send_response(200)
@@ -317,8 +332,71 @@ def run_monitor_ui(host: str, port: int, ws_port: int) -> ThreadingHTTPServer:
                 self.wfile.write(body)
                 return
             if path == "/api/ping":
-                body = b'{"ok": true}'
+                # Backward-compatible default ping, plus optional richer checks via query params:
+                # - ?deep=1
+                # - ?device_id=1
+                # - ?screenshot=1
+                # - ?mock=1
+                # - ?ws=1
+                result = {"ok": True, "ui": "ok"}
+
+                deep = _q_bool("deep", False)
+                include_ws = _q_bool("ws", False)
+
+                if deep and service is not None:
+                    payload = {
+                        "op": "health_check",
+                        "device_id": _q_int("device_id"),
+                        "include_screenshot": _q_bool("screenshot", False),
+                        "include_mock_ops": _q_bool("mock", False),
+                    }
+                    result["health"] = service.health_check(payload)
+                    result["ok"] = bool(result["ok"] and result["health"].get("ok", False))
+
+                if include_ws:
+                    try:
+                        from websockets.sync.client import connect
+
+                        ws_url = f"ws://127.0.0.1:{ws_port}"
+                        with connect(ws_url, open_timeout=5, close_timeout=5) as ws:
+                            ws.send(json.dumps({"request_id": "http-ping", "op": "monitor_state"}))
+                            resp = ws.recv(timeout=8)
+                        ws_resp = json.loads(resp) if isinstance(resp, str) else {}
+                        result["ws_bridge"] = {
+                            "ok": bool(ws_resp.get("ok", False)),
+                            "url": ws_url,
+                        }
+                        result["ok"] = bool(result["ok"] and result["ws_bridge"]["ok"])
+                    except Exception as e:
+                        result["ws_bridge"] = {"ok": False, "error": str(e)}
+                        result["ok"] = False
+
+                body = json.dumps(result, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/api/health":
+                if service is None:
+                    body = b'{"ok": false, "error": "service_not_available"}'
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                payload = {
+                    "op": "health_check",
+                    "device_id": _q_int("device_id"),
+                    "include_screenshot": _q_bool("screenshot", True),
+                    "include_mock_ops": _q_bool("mock", True),
+                }
+                result = service.health_check(payload)
+                body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                self.send_response(200 if result.get("ok", False) else 503)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()

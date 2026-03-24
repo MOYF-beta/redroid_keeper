@@ -359,6 +359,130 @@ class RedroidWSService:
             pass
         return {"ok": True, "closed": True}
 
+    def _health_check_device(
+        self,
+        device_id: int,
+        *,
+        include_screenshot: bool = False,
+        include_mock_ops: bool = False,
+    ) -> Dict[str, Any]:
+        report: Dict[str, Any] = {
+            "device_id": int(device_id),
+            "ok": True,
+            "checks": {},
+            "errors": [],
+            "timing_ms": {},
+        }
+
+        try:
+            self._assert_device_allowed(device_id)
+            report["checks"]["allowed"] = True
+        except Exception as e:
+            report["checks"]["allowed"] = False
+            report["errors"].append(f"allowed_check_failed: {e}")
+            report["ok"] = False
+            return report
+
+        cfg = self._device_cfg_by_id.get(device_id)
+        if cfg is not None:
+            try:
+                t0 = time.time()
+                report["checks"]["container_exists"] = self._docker_container_exists(cfg.container_name)
+                report["checks"]["container_running"] = self._docker_container_running(cfg.container_name)
+                report["timing_ms"]["container_probe"] = int((time.time() - t0) * 1000)
+            except Exception as e:
+                report["checks"]["container_probe"] = False
+                report["errors"].append(f"container_probe_failed: {e}")
+                report["ok"] = False
+
+        runtime = None
+        try:
+            t0 = time.time()
+            runtime = self._get_runtime(device_id)
+            report["checks"]["runtime_ready"] = True
+            report["timing_ms"]["runtime_ready"] = int((time.time() - t0) * 1000)
+        except Exception as e:
+            report["checks"]["runtime_ready"] = False
+            report["errors"].append(f"runtime_ready_failed: {e}")
+            report["ok"] = False
+            return report
+
+        assert runtime is not None
+        with runtime.lock:
+            try:
+                t0 = time.time()
+                focus = runtime.device.get_focus()
+                raw_focus = str(focus.get("raw", ""))
+                report["checks"]["focus_ok"] = bool(raw_focus)
+                report["focus_preview"] = raw_focus[:300]
+                report["timing_ms"]["focus"] = int((time.time() - t0) * 1000)
+                if not raw_focus:
+                    report["errors"].append("focus_empty")
+                    report["ok"] = False
+            except Exception as e:
+                report["checks"]["focus_ok"] = False
+                report["errors"].append(f"focus_failed: {e}")
+                report["ok"] = False
+
+            if include_screenshot:
+                try:
+                    t0 = time.time()
+                    img = runtime.device.screenshot()
+                    report["checks"]["screenshot_ok"] = True
+                    report["screenshot_size"] = [int(img.width), int(img.height)]
+                    report["timing_ms"]["screenshot"] = int((time.time() - t0) * 1000)
+                except Exception as e:
+                    report["checks"]["screenshot_ok"] = False
+                    report["errors"].append(f"screenshot_failed: {e}")
+                    report["ok"] = False
+
+            if include_mock_ops:
+                try:
+                    t0 = time.time()
+                    runtime.device.key_home()
+                    time.sleep(0.2)
+                    _ = runtime.device.get_focus()
+                    report["checks"]["mock_key_home_ok"] = True
+                    report["timing_ms"]["mock_key_home"] = int((time.time() - t0) * 1000)
+                except Exception as e:
+                    report["checks"]["mock_key_home_ok"] = False
+                    report["errors"].append(f"mock_key_home_failed: {e}")
+                    report["ok"] = False
+
+        return report
+
+    def health_check(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        include_screenshot = bool(payload.get("include_screenshot", False))
+        include_mock_ops = bool(payload.get("include_mock_ops", False))
+
+        if payload.get("device_id") is not None:
+            device_ids = [int(payload.get("device_id"))]
+        elif self._allowed_device_ids is not None:
+            device_ids = sorted(self._allowed_device_ids)
+        else:
+            device_ids = sorted(self._runtimes.keys())
+
+        reports = [
+            self._health_check_device(
+                did,
+                include_screenshot=include_screenshot,
+                include_mock_ops=include_mock_ops,
+            )
+            for did in device_ids
+        ]
+
+        return {
+            "ok": all(bool(r.get("ok", False)) for r in reports),
+            "service": {
+                "adb_host": self.adb_host,
+                "trajectory_root": self.trajectory_root,
+                "config_path": self.config_path,
+                "allowed_device_ids": sorted(self._allowed_device_ids) if self._allowed_device_ids else [],
+                "runtime_count": len(self._runtimes),
+            },
+            "reports": reports,
+        }
+
     def process(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         op = str(payload.get("op", "")).lower().strip()
         if op == "monitor_state":
@@ -366,6 +490,8 @@ class RedroidWSService:
                 "ok": True,
                 "monitor_snapshot": self.monitor_snapshot(),
             }
+        if op == "health_check":
+            return self.health_check(payload)
 
         device_id = int(payload.get("device_id"))
         response: Dict[str, Any]
@@ -442,7 +568,7 @@ def main():
         trajectory_root=trajectory_root,
         config_path=config_path,
     )
-    run_monitor_ui(args.host, args.ui_port, ws_port=args.port)
+    run_monitor_ui(args.host, args.ui_port, ws_port=args.port, service=service)
     asyncio.run(serve(args.host, args.port, service))
 
 
